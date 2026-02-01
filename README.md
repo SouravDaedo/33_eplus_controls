@@ -1,13 +1,14 @@
 # EnergyPlus Python-Only Controls
 
-A complete Python-only EnergyPlus simulation environment that requires **no manual EnergyPlus installation**. Everything runs through pip-installed packages with automatic version-matched model downloads.
+A complete Python-only EnergyPlus simulation environment that requires **no manual EnergyPlus installation**. Everything runs through pip-installed packages.
 
 ## Features
 
 - ✅ **No manual EnergyPlus install required** - Everything via `pip`
-- ✅ **Automatic version matching** - Downloads models that match your installed EnergyPlus version
+- ✅ **Generic simulation runner** - Run any IDF with any weather file
+- ✅ **Weather data downloader** - Download from Open-Meteo (2024/2025) or PVGIS (TMY)
+- ✅ **Automatic IDF sync** - Update IDF run periods to match weather data
 - ✅ **Batch processing** - Run multiple building models automatically
-- ✅ **Version checking** - Verify your installation and compatibility
 
 ## Quick Start
 
@@ -17,110 +18,151 @@ A complete Python-only EnergyPlus simulation environment that requires **no manu
 pip install -r requirements.txt
 ```
 
-This installs:
-- `pyenergyplus` - The EnergyPlus simulation engine
-- `requests` - For downloading model files
-- `pandas` - For analyzing results (optional)
-
-### 2. Run Your First Simulation
+### 2. Run a Simulation
 
 ```bash
-python run_simulation.py
+python run_sim.py --idf energyplus/models/RefBldgMediumOfficeNew2004_Chicago.idf --epw weather/USA_IL_Chicago-OHare.Intl.AP.725300_TMY3.epw --output outputs/test
 ```
 
-This will:
-1. Detect your installed EnergyPlus version
-2. Download a simple test model (`1ZoneUncontrolled.idf`) from GitHub
-3. Download matching weather data (Chicago)
-4. Run the simulation
-5. Generate results in the `outputs/` directory
-
-### 3. Check Your Installation
+### 3. Download Weather Data
 
 ```bash
-python check_version.py
+# Download 2024 summer data for Atlanta
+python download_weather.py --lat 33.75 --lon -84.39 --start 2024-06-01 --end 2024-09-30 --output weather/atlanta
+
+# Download TMY data
+python download_weather.py --lat 41.88 --lon -87.63 --tmy --output weather/chicago
 ```
 
-This displays:
-- Installed EnergyPlus version
-- Package location
-- API status
+## Model Versions
+
+| Model | EnergyPlus Version | Compatible |
+|-------|-------------------|------------|
+| RefBldgMediumOfficeNew2004_Chicago | 23.2 | ✓ Match |
+| RefBldgLargeHotelNew2004_Chicago | 23.2 | ✓ Match |
+| RefBldgPrimarySchoolNew2004_Chicago | 23.2 | ✓ Match |
+| ASHRAE901_OfficeMedium_STD2022_Denver | 22.1 | ⚠️ Older |
+| ASHRAE901_OfficeLarge_STD2022_Denver | 25.2 | ❌ Too new |
+| ASHRAE901_SchoolPrimary_STD2022_Denver | 22.1 | ⚠️ Older |
 
 ## Project Structure
 
 ```
 33_eplus_controls/
-├── data/                    # Downloaded models and weather files
-├── outputs/                 # Simulation results (single runs)
-├── batch_outputs/           # Batch simulation results
-├── run_simulation.py        # Main simulation runner
-├── batch_runner.py          # Run multiple models
-├── check_version.py         # Version checker
-├── requirements.txt         # Python dependencies
-└── README.md               # This file
+├── energyplus/models/       # All IDF model files
+│   ├── RefBldgMediumOfficeNew2004_Chicago.idf
+│   ├── RefBldgLargeHotelNew2004_Chicago.idf
+│   ├── RefBldgPrimarySchoolNew2004_Chicago.idf
+│   ├── ASHRAE901_OfficeMedium_STD2022_Denver.idf
+│   └── ...
+├── weather/                 # Weather files (EPW)
+├── outputs/                 # Simulation results
+├── run_sim.py              # Generic simulation runner
+├── download_weather.py     # Weather data downloader
+├── check_engine.py         # Engine version checker
+├── batch_runner.py         # Batch simulation runner
+├── analyze_annual_results.py
+├── requirements.txt
+└── README.md
 ```
 
 ## Scripts
 
-### `run_simulation.py`
-Runs a single simulation with automatic version-matched file downloads.
+### `run_sim.py`
+Generic EnergyPlus simulation runner.
 
-**What it does:**
-- Detects your EnergyPlus version
-- Downloads `1ZoneUncontrolled.idf` (simple test model)
-- Downloads Chicago weather file
-- Runs simulation
-- Lists output files
+```bash
+# Basic usage
+python run_sim.py --idf model.idf --epw weather.epw
 
-**Output files:**
-- `outputs/eplustbl.htm` - Summary report (open in browser)
-- `outputs/eplusout.csv` - Detailed timeseries data
-- `outputs/eplusout.err` - Warnings and errors
+# With custom output directory
+python run_sim.py --idf model.idf --epw weather.epw --output results/
+```
+
+### `download_weather.py`
+Download weather data from Open-Meteo (global, 2024/2025) or PVGIS (TMY).
+
+```bash
+# Download 2024 data (Open-Meteo)
+python download_weather.py --lat 33.75 --lon -84.39 --start 2024-06-01 --end 2024-09-30
+
+# Download TMY (PVGIS)
+python download_weather.py --lat 41.88 --lon -87.63 --tmy
+
+# Download and update IDF run period
+python download_weather.py --lat 33.75 --lon -84.39 --start 2024-06-01 --end 2024-09-30 --update-idf model.idf
+
+# Sync existing EPW to IDF
+python download_weather.py --sync-epw weather.epw --update-idf model.idf
+```
+
+**Weather Data Sources:**
+| Source | Coverage | Years | Best For |
+|--------|----------|-------|----------|
+| Open-Meteo | Global | 1940-present (5-day delay) | 2024/2025, specific dates |
+| PVGIS | Europe/Africa/Med | Up to 2023 | TMY data |
 
 ### `batch_runner.py`
-Runs multiple building models in sequence.
-
-**What it does:**
-- Downloads 3 different building models
-- Runs each with the same weather file
-- Saves results to separate directories
-- Provides summary of successes/failures
-
-**Models tested:**
-1. `1ZoneUncontrolled.idf` - Simple box
-2. `5ZoneAutoDXVAV.idf` - Commercial building with HVAC
-3. `RefBldgSmallOfficeNew2004_Chicago.idf` - DOE reference building
+Run multiple building models in sequence.
 
 ```bash
 python batch_runner.py
 ```
 
-### `check_version.py`
-Displays your EnergyPlus installation details.
+### `check_engine.py`
+Check EnergyPlus engine version and model compatibility.
 
 ```bash
-python check_version.py
+# Check engine version
+python check_engine.py
+
+# Check engine + model compatibility
+python check_engine.py --check-models
+```
+
+**Example output:**
+```
+============================================================
+ENERGYPLUS ENGINE VERSION CHECK
+============================================================
+
+Pip Package: pyenergyplus-lbnl 25.1.2
+
+Engine Version: EnergyPlus 23.2.0-7636e6b3e9
+
+⚠️  Note: Pip version (25.1.2) differs from engine version (23.2.0)
+============================================================
+
+MODEL COMPATIBILITY CHECK
+============================================================
+
+Engine: 23.2.0
+------------------------------------------------------------
+Model                                              Version  Status
+------------------------------------------------------------
+RefBldgMediumOfficeNew2004_Chicago.idf             23.2     ✓ Match
+ASHRAE901_OfficeLarge_STD2022_Denver.idf           25.2     ❌ Too new
+ASHRAE901_OfficeMedium_STD2022_Denver.idf          22.1     ⚠️ Older (may work)
+------------------------------------------------------------
 ```
 
 ## Version Management
 
-### Check Current Version
+### Check Engine Version
 ```bash
-pip show pyenergyplus
+python check_engine.py
 ```
 
-### Install Specific Version
+### Check Pip Package
 ```bash
-pip install pyenergyplus==24.1.0
-```
-
-### Upgrade to Latest
-```bash
-pip install --upgrade pyenergyplus
+pip show pyenergyplus-lbnl
 ```
 
 ### Version Compatibility
-The scripts automatically download models that match your installed version. EnergyPlus is strict about version compatibility - a v24.1 model may not work with v25.1 without transition.
+EnergyPlus is strict about version compatibility:
+- **✓ Match** - Model version equals engine version
+- **⚠️ Older** - Older models usually work with newer engines
+- **❌ Too new** - Newer models will NOT work with older engines
 
 ## Understanding Output Files
 
