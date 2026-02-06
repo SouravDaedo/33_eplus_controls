@@ -32,7 +32,7 @@ class RuleBasedController:
     """
     
     def __init__(self):
-        # Control parameters - tune these as needed
+        # Control tunable  parameters
         self.power_threshold_high = 150000  # W
         self.power_threshold_low = 50000    # W
         self.oat_hot = 30.0                 # °C
@@ -143,10 +143,11 @@ def prepare_idf(
     start_day: int = None,
     end_month: int = None,
     end_day: int = None,
-    timestep: int = None
+    timestep: int = None,
+    eplus_version: str = None
 ) -> str:
     """
-    Prepare IDF file with modified RunPeriod and Timestep using eppy.
+    Prepare IDF file with modified RunPeriod and Timestep using regex.
     
     Args:
         idf_path: Path to source IDF file
@@ -160,67 +161,71 @@ def prepare_idf(
     Returns:
         Path to modified IDF file
     """
-    from eppy.modeleditor import IDF
+    import re
     
-    # Find IDD file (needed by eppy)
-    try:
-        from pyenergyplus.api import EnergyPlusAPI
-        api = EnergyPlusAPI()
-        # Get EnergyPlus install directory from the API
-        import pyenergyplus
-        eplus_dir = os.path.dirname(os.path.dirname(pyenergyplus.__file__))
-        # Try common locations
-        idd_paths = [
-            os.path.join(eplus_dir, 'Energy+.idd'),
-            'C:/EnergyPlusV23-2-0/Energy+.idd',
-            'C:/EnergyPlusV24-1-0/Energy+.idd',
-            'C:/EnergyPlusV24-2-0/Energy+.idd',
-            'C:/EnergyPlusV25-1-0/Energy+.idd',
-            'C:/EnergyPlusV25-2-0/Energy+.idd',
-            'C:/EnergyPlusV22-1-0/Energy+.idd',
-        ]
-        idd_file = None
-        for path in idd_paths:
-            if os.path.exists(path):
-                idd_file = path
-                break
-        if not idd_file:
-            print("Warning: Could not find Energy+.idd, using IDF without modification")
-            return idf_path
-    except Exception as e:
-        print(f"Warning: Could not locate IDD file: {e}")
-        return idf_path
-    
-    # Set IDD file for eppy
-    IDF.setiddname(idd_file)
-    
-    # Load IDF
-    idf = IDF(idf_path)
+    # Read IDF content
+    with open(idf_path, 'r') as f:
+        content = f.read()
     
     modified = False
     
     # Modify Timestep
     if timestep is not None:
-        timesteps = idf.idfobjects['TIMESTEP']
-        if timesteps:
-            timesteps[0].Number_of_Timesteps_per_Hour = timestep
+        # Match Timestep object: Timestep,\n  N;
+        pattern = r'(Timestep\s*,\s*)\n(\s*)(\d+)\s*;'
+        replacement = rf'\1\n\g<2>{timestep};'
+        new_content = re.sub(pattern, replacement, content, flags=re.IGNORECASE)
+        if new_content != content:
+            content = new_content
             print(f"  Timestep set to {timestep} per hour ({60//timestep} min intervals)")
             modified = True
     
     # Modify RunPeriod
     if any([start_month, start_day, end_month, end_day]):
-        runperiods = idf.idfobjects['RUNPERIOD']
-        if runperiods:
-            rp = runperiods[0]
-            if start_month is not None:
-                rp.Begin_Month = start_month
-            if start_day is not None:
-                rp.Begin_Day_of_Month = start_day
-            if end_month is not None:
-                rp.End_Month = end_month
-            if end_day is not None:
-                rp.End_Day_of_Month = end_day
-            print(f"  RunPeriod: {rp.Begin_Month}/{rp.Begin_Day_of_Month} to {rp.End_Month}/{rp.End_Day_of_Month}")
+        lines = content.split('\n')
+        in_runperiod = False
+        field_idx = 0
+        new_lines = []
+        rp_modified = False
+        
+        for line in lines:
+            # Check if we're entering a RunPeriod object (not RunPeriodControl)
+            if re.match(r'\s*RunPeriod\s*,', line, re.IGNORECASE) and 'Control' not in line:
+                in_runperiod = True
+                field_idx = 0
+                new_lines.append(line)
+                continue
+            
+            if in_runperiod:
+                field_idx += 1
+                # Field 1: Name, Field 2: Begin Month, Field 3: Begin Day, Field 4: Begin Year
+                # Field 5: End Month, Field 6: End Day
+                if field_idx == 2 and start_month is not None:
+                    line = re.sub(r'^\s*\d+', f'    {start_month}', line)
+                    rp_modified = True
+                elif field_idx == 3 and start_day is not None:
+                    line = re.sub(r'^\s*\d+', f'    {start_day}', line)
+                    rp_modified = True
+                elif field_idx == 5 and end_month is not None:
+                    line = re.sub(r'^\s*\d+', f'    {end_month}', line)
+                    rp_modified = True
+                elif field_idx == 6 and end_day is not None:
+                    line = re.sub(r'^\s*\d+', f'    {end_day}', line)
+                    rp_modified = True
+                
+                # Check if this line ends the object
+                if ';' in line:
+                    in_runperiod = False
+            
+            new_lines.append(line)
+        
+        if rp_modified:
+            content = '\n'.join(new_lines)
+            sm = start_month if start_month else '?'
+            sd = start_day if start_day else '?'
+            em = end_month if end_month else '?'
+            ed = end_day if end_day else '?'
+            print(f"  RunPeriod: {sm}/{sd} to {em}/{ed}")
             modified = True
     
     if not modified:
@@ -229,7 +234,8 @@ def prepare_idf(
     # Save modified IDF
     os.makedirs(output_dir, exist_ok=True)
     modified_idf_path = os.path.join(output_dir, 'model_modified.idf')
-    idf.saveas(modified_idf_path)
+    with open(modified_idf_path, 'w') as f:
+        f.write(content)
     print(f"  Saved modified IDF to: {modified_idf_path}")
     
     return modified_idf_path
@@ -246,7 +252,8 @@ def run_controlled_simulation(
     start_day: int = None,
     end_month: int = None,
     end_day: int = None,
-    timestep: int = None
+    timestep: int = None,
+    eplus_version: str = '22-1-0'
 ):
     """
     Run simulation with external controller.
@@ -263,6 +270,7 @@ def run_controlled_simulation(
         end_month: End month (1-12)
         end_day: End day of month
         timestep: Timesteps per hour
+        eplus_version: EnergyPlus version string (e.g., '23-2-0')
     """
     # Import the environment
     from eplus_env import EnergyPlusEnv
@@ -282,7 +290,8 @@ def run_controlled_simulation(
         print("\nModifying IDF settings:")
         idf_path = prepare_idf(
             idf_path, output_dir,
-            start_month, start_day, end_month, end_day, timestep
+            start_month, start_day, end_month, end_day, timestep,
+            eplus_version=eplus_version
         )
     
     # Create environment and controller
@@ -437,6 +446,8 @@ Examples:
                         help='End date as M/D (e.g., 7/31 for July 31)')
     parser.add_argument('--timestep', type=int, default=None,
                         help='Timesteps per hour (4=15min, 6=10min, 12=5min)')
+    parser.add_argument('--eplus-version', type=str, default='22-1-0',
+                        help='EnergyPlus version for IDD file (e.g., 22-1-0, 25-2-0)')
     
     args = parser.parse_args()
     
@@ -470,7 +481,8 @@ Examples:
         start_day=start_day,
         end_month=end_month,
         end_day=end_day,
-        timestep=args.timestep
+        timestep=args.timestep,
+        eplus_version=args.eplus_version
     )
     
     return 0
