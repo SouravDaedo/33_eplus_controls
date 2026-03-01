@@ -32,14 +32,13 @@ except ImportError:
     sys.exit(1)
 
 from src.agents.sac_agent import SACAgent
-from src.utils.hvac_config import HVACConfig, get_hvac_config
+from src.utils.hvac_config import get_hvac_config
 from src.utils.energy_price import get_realtime_price
 from src.utils.outdoor_co2_schedule import load_outdoor_co2_csv
 from src.utils.idf_modifier import (
     create_custom_idf,
     calculate_simulation_days,
     get_season_info,
-    end_date_from_duration,
 )
 
 
@@ -116,8 +115,20 @@ class HVACEnvironment:
         self.prev_energy = 0.0
 
         # Cached power (W) from callback_after_predictor_after_hvac_managers
-        # because Facility Total Electricity Demand Rate resets before zone timestep callback fires
+        # (electricity and gas demand rates reset before zone timestep callback fires)
         self._cached_power_w = 0.0
+        self._cached_gas_power_w = 0.0
+
+        # Programmatic overrides — set these from outside before each timestep to inject custom data.
+        # Applied via pre_timestep_callback (before zone heat-balance calcs) each step.
+        #
+        # outdoor_co2_override: float | None   — ppm; takes priority over CSV lookup and config static value
+        # weather_override: dict | None         — keys: dry_bulb[°C], dew_point[°C], humidity[%],
+        #                                          wind_speed[m/s], wind_dir[deg], sky_temp[°C],
+        #                                          beam_solar[W/m²], diffuse_solar[W/m²]
+        #                                          Only override the fields you include.
+        self.outdoor_co2_override = None
+        self.weather_override = None
 
         # Handles (initialized during warmup)
         self.handles_initialized = False
@@ -212,27 +223,87 @@ class HVACEnvironment:
         )
         if self.handles['total_power'] <= 0:
             print("Warning: Facility Total Electricity Demand Rate handle invalid; energy_cost and demand will be 0.")
-        
-        # Outdoor CO2 schedule actuator (for CSV override at each timestep; requires EMS actuator in IDF)
+
+        # Natural gas: "Facility Total Natural Gas Demand Rate" [W thermal], key "Whole Building"
+        # Injected as Output:Variable by create_custom_idf.
+        self.handles['gas_power'] = exchange.get_variable_handle(
+            self.state, "Facility Total Natural Gas Demand Rate", "Whole Building"
+        )
+        if self.handles['gas_power'] <= 0:
+            print("Warning: Facility Total Natural Gas Demand Rate handle invalid; gas_cost will be 0.")
+
+        # Outdoor CO2 schedule actuator — set_actuator_value overrides the schedule each step
         self.handles['outdoor_co2'] = exchange.get_actuator_handle(
             self.state, "Schedule:Constant", "Schedule Value", "Outdoor CO2 Schedule"
         )
+
+        # Weather Data actuators — override EPW values each step via apply_weather_override().
+        # All use component type "Weather Data", key "Environment".
+        _weather_ctrl_types = {
+            'dry_bulb':      'Outdoor Dry Bulb',
+            'dew_point':     'Outdoor Dew Point',
+            'humidity':      'Outdoor Relative Humidity',
+            'wind_speed':    'Wind Speed',
+            'wind_dir':      'Wind Direction',
+            'sky_temp':      'Sky Temperature',
+            'beam_solar':    'Beam Solar',
+            'diffuse_solar': 'Diffuse Solar',
+        }
+        self.handles['weather'] = {}
+        for key, ctrl_type in _weather_ctrl_types.items():
+            self.handles['weather'][key] = exchange.get_actuator_handle(
+                self.state, "Weather Data", ctrl_type, "Environment"
+            )
         
         self.handles_initialized = True
         return True
     
     def apply_outdoor_co2_for_current_timestep(self):
-        """If outdoor CO2 CSV is loaded, set the outdoor CO2 schedule to the value for current sim time."""
-        if not self.outdoor_co2_lookup or not self.handles_initialized:
+        """Set outdoor CO2 schedule actuator for this timestep.
+
+        Priority: outdoor_co2_override (programmatic) > CSV lookup > no-op.
+        Set env.outdoor_co2_override = <ppm> at any time to inject a custom value every step.
+        """
+        if not self.handles_initialized:
             return
         h = self.handles.get('outdoor_co2', -1)
         if h is None or h <= 0:
             return
-        month = self.api.exchange.month(self.state)
-        day = self.api.exchange.day_of_month(self.state)
-        hour = self.api.exchange.hour(self.state)
-        ppm = self.outdoor_co2_lookup.get_ppm(month, day, hour)
+        if self.outdoor_co2_override is not None:
+            ppm = float(self.outdoor_co2_override)
+        elif self.outdoor_co2_lookup:
+            month = self.api.exchange.month(self.state)
+            day = self.api.exchange.day_of_month(self.state)
+            hour = self.api.exchange.hour(self.state)
+            ppm = self.outdoor_co2_lookup.get_ppm(month, day, hour)
+        else:
+            return
         self.api.exchange.set_actuator_value(self.state, h, ppm)
+
+    def apply_weather_override(self):
+        """Override EPW weather values for this timestep from env.weather_override dict.
+
+        Set env.weather_override = {'dry_bulb': 25.0, 'humidity': 60.0, ...} to inject custom
+        weather each step. Only the keys you include are overridden; unset keys keep EPW values.
+
+        Keys and units:
+            dry_bulb      [°C]    outdoor dry-bulb temperature
+            dew_point     [°C]    outdoor dew-point temperature
+            humidity      [%]     outdoor relative humidity (0–100)
+            wind_speed    [m/s]   wind speed
+            wind_dir      [deg]   wind direction (0–360)
+            sky_temp      [°C]    sky temperature
+            beam_solar    [W/m²]  direct normal solar radiation
+            diffuse_solar [W/m²]  diffuse horizontal solar radiation
+        """
+        if not self.handles_initialized or not self.weather_override:
+            return
+        exchange = self.api.exchange
+        weather_handles = self.handles.get('weather', {})
+        for key, value in self.weather_override.items():
+            h = weather_handles.get(key, -1)
+            if h and h > 0:
+                exchange.set_actuator_value(self.state, h, float(value))
     
     def get_current_state(self):
         """Get current environment state from EnergyPlus."""
@@ -358,7 +429,7 @@ class HVACEnvironment:
         cooling_sp = self.base_temp + heating_sp_offset + deadband/2
         
         # Apply to all zones
-        for zone_name, handles in self.handles['zones'].items():
+        for _, handles in self.handles['zones'].items():
             if handles['heating_sp'] > 0:
                 exchange.set_actuator_value(self.state, handles['heating_sp'], heating_sp)
             if handles['cooling_sp'] > 0:
@@ -380,7 +451,7 @@ class HVACEnvironment:
             comfort_penalty = 0.0
             if self.handles_initialized:
                 exchange = self.api.exchange
-                for zone_name, zhandles in self.handles['zones'].items():
+                for _, zhandles in self.handles['zones'].items():
                     h = zhandles.get('ppd', -1)
                     if h and h > 0:
                         ppd = exchange.get_variable_value(self.state, h)
@@ -421,11 +492,13 @@ class HVACEnvironment:
         dt_hours = 1.0 / self.timesteps_per_hour
         current_power = self._cached_power_w
         energy_kwh = (current_power / 1000.0) * dt_hours
-        if not getattr(self, '_power_handle_logged', False):
-            self._power_handle_logged = True
-            src = 'cached_hvac' if self.handles.get('total_power', -1) > 0 else 'NONE'
-            print(f"Debug: energy source={src}, handle={self.handles.get('total_power', -1)}, power={current_power:.1f} W")
         energy_cost = energy_kwh * energy_price_used * ENERGY_WEIGHT
+
+        GAS_WEIGHT = reward_config.get('gas_weight', 0.3)
+        GAS_PRICE = reward_config.get('gas_price_per_kwh', 0.017)
+        current_gas_power = self._cached_gas_power_w
+        gas_kwh = (current_gas_power / 1000.0) * dt_hours  # W thermal -> kWh thermal
+        gas_cost = gas_kwh * GAS_PRICE * GAS_WEIGHT
         
         comfort_penalty = self._compute_comfort_penalty(reward_config, zone_temps)
         
@@ -447,12 +520,13 @@ class HVACEnvironment:
             demand_penalty = (current_power_kw - DEMAND_THRESHOLD) * 0.2
         demand_penalty *= DEMAND_WEIGHT
         
-        total_cost = energy_cost + comfort_penalty + setpoint_penalty + demand_penalty
+        total_cost = energy_cost + gas_cost + comfort_penalty + setpoint_penalty + demand_penalty
         reward = -total_cost
-        
+
         return {
             'reward': reward,
             'energy_cost': energy_cost,
+            'gas_cost': gas_cost,
             'comfort_penalty': comfort_penalty,
             'setpoint_penalty': setpoint_penalty,
             'demand_penalty': demand_penalty,
@@ -460,9 +534,11 @@ class HVACEnvironment:
             'energy_price_used': energy_price_used,
             'energy_kwh': energy_kwh,
             'current_power': current_power,
+            'gas_kwh': gas_kwh,
+            'current_gas_power': current_gas_power,
         }
     
-    def calculate_reward(self, prev_state, action, curr_state):
+    def calculate_reward(self, action, curr_state):
         """Calculate reward based on energy efficiency and thermal comfort (uses compute_reward_components)."""
         reward_config = self.hvac_config.config['reward']
         zone_temps = curr_state[:5]
@@ -481,7 +557,7 @@ class HVACEnvironment:
         
         # Calculate reward
         if prev_state is not None:
-            reward = self.calculate_reward(prev_state, action, self.current_state)
+            reward = self.calculate_reward(action, self.current_state)
         else:
             reward = 0.0
         
@@ -490,7 +566,6 @@ class HVACEnvironment:
         self.timestep_count += 1
         
         # Check if episode is done (after 1 hour of timesteps)
-        current_hour = self.api.exchange.hour(self.state)
         current_day = self.api.exchange.day_of_month(self.state)
         
         # Episode end: use variable duration if set, else config default
@@ -555,15 +630,38 @@ class RLHVACController:
         self._co2_400_warned = False  # one-time diagnostic for CO2 stuck at 400
 
     def power_cache_callback(self, state):
-        """Cache Facility Total Electricity Demand Rate before it resets after zone reporting.
+        """Cache electricity and gas demand rates before they reset after zone reporting.
         Registered for callback_after_predictor_after_hvac_managers (fires during HVAC sub-iterations).
         """
         if self.api.exchange.warmup_flag(state):
             return
-        if self.env.handles_initialized and self.env.handles.get('total_power', -1) > 0:
-            self.env._cached_power_w = self.api.exchange.get_variable_value(
+        if not self.env.handles_initialized:
+            return
+        exchange = self.api.exchange
+        if self.env.handles.get('total_power', -1) > 0:
+            self.env._cached_power_w = exchange.get_variable_value(
                 self.state, self.env.handles['total_power']
             )
+        if self.env.handles.get('gas_power', -1) > 0:
+            self.env._cached_gas_power_w = exchange.get_variable_value(
+                self.state, self.env.handles['gas_power']
+            )
+
+    def pre_timestep_callback(self, state):
+        """Apply CO2 and weather overrides before zone heat-balance calculations.
+        Registered for callback_begin_zone_timestep_before_init_heat_balance so that overrides
+        take effect for the current timestep's energy calculations.
+
+        Usage — set on env before/during each step:
+            controller.env.outdoor_co2_override = 500.0         # ppm
+            controller.env.weather_override = {'dry_bulb': 28.0, 'humidity': 55.0}
+        """
+        if self.api.exchange.warmup_flag(state):
+            return
+        if not self.env.handles_initialized:
+            return
+        self.env.apply_outdoor_co2_for_current_timestep()
+        self.env.apply_weather_override()
 
     def timestep_callback(self, state):
         """Called at each EnergyPlus timestep."""
@@ -619,7 +717,7 @@ class RLHVACController:
             action = self.agent.select_action(current_state, evaluate=True)
         
         # Execute action
-        next_state, reward, done, info = self.env.step(action)
+        next_state, reward, done, _ = self.env.step(action)
         
         # Reward components from single source (same as env.calculate_reward); includes real-time price
         reward_config = self.env.hvac_config.config['reward']
@@ -627,6 +725,7 @@ class RLHVACController:
         components = self.env.compute_reward_components(reward_config, zone_temps, action)
         reward = components['reward']
         energy_cost = components['energy_cost']
+        gas_cost = components['gas_cost']
         comfort_penalty = components['comfort_penalty']
         setpoint_penalty = components['setpoint_penalty']
         demand_penalty = components['demand_penalty']
@@ -634,6 +733,8 @@ class RLHVACController:
         current_power = components['current_power']
         energy_price_used = components['energy_price_used']
         energy_kwh = components['energy_kwh']
+        gas_kwh = components['gas_kwh']
+        current_gas_power = components['current_gas_power']
         
         # Store experience if training
         if self.training_mode:
@@ -688,6 +789,7 @@ class RLHVACController:
             'action': action.tolist(),
             'reward': reward,
             'energy_cost': energy_cost,
+            'gas_cost': gas_cost,
             'comfort_penalty': comfort_penalty,
             'setpoint_penalty': setpoint_penalty,
             'demand_penalty': demand_penalty,
@@ -695,6 +797,8 @@ class RLHVACController:
             'energy_price_used': energy_price_used,
             'energy_kwh': energy_kwh,
             'current_power': current_power,
+            'gas_kwh': gas_kwh,
+            'current_gas_power': current_gas_power,
             'avg_zone_temp': np.mean(current_state[:5]),
             'outdoor_temp': current_state[5],
             'episode_reward': self.env.episode_reward,
@@ -709,8 +813,6 @@ class RLHVACController:
         
         # Print progress (use step-within-episode for display; variable-length episodes)
         timestep_minutes = 60 // self.env.timesteps_per_hour
-        steps_this_episode = (self.env._episode_duration_timesteps if self.env._episode_duration_timesteps is not None
-                              else self.env.episode_timesteps)
         episode_step = self.env.timestep_count  # 0-based step within current episode (no modulo wrap)
         
         # Get actual time from EnergyPlus
@@ -746,7 +848,7 @@ class RLHVACController:
         print(f"{datetime_str} | Step {episode_step:3d}")
         print(f"   Actions: raw [{action[0]:+.2f}, {action[1]:+.2f}, {action[2]:+.2f}]  ->  heating_offset={heating_sp_offset:+5.2f}°C  deadband={deadband:4.2f}°C  airflow={airflow_actual:.4f} m³/s")
         print(f"   States:  zone_temps=[{zone_str}]°C  outdoor_temp={outdoor_temp:5.1f}°C")
-        print(f"   Reward: {reward:7.3f}  episode_total={self.env.episode_reward:7.3f}  |  energy_cost={energy_cost:.4f}  comfort={comfort_penalty:.4f}  setpoint={setpoint_penalty:.4f}  demand={demand_penalty:.4f}  total_cost={total_cost:.4f}  |  price={energy_price_used:.3f}  kWh={energy_kwh:.4f}  |  memory_len={len(self.agent.memory)}")
+        print(f"   Reward: {reward:7.3f}  episode_total={self.env.episode_reward:7.3f}  |  elec_cost[$]={energy_cost:.4f}  gas_cost[$]={gas_cost:.4f}  comfort={comfort_penalty:.4f}  setpoint={setpoint_penalty:.4f}  demand_penalty[$]={demand_penalty:.4f}  total_cost={total_cost:.4f}  |  price[$/kWh]={energy_price_used:.3f}  elec[kWh]={energy_kwh:.4f}  elec[kW]={current_power/1000:.2f}  gas[kWh]={gas_kwh:.4f}  gas[kW]={current_gas_power/1000:.2f}")
         print()
         
         # Reset if episode done: sample next random start (after current time) and duration
@@ -813,7 +915,7 @@ RL HVAC Control Summary:
         print(f"Saved {len(self.log_data)} timesteps to {filepath}")
 
 
-def run_simulation(idf_path, epw_path, output_dir, config, max_episodes=None, training_mode=False):
+def run_simulation(idf_path, epw_path, output_dir, config, max_episodes=None, training_mode=False, override_test=False):
     """Run EnergyPlus simulation with RL HVAC control.
     
     Simulation is driven by config training_window (start/end date and time) and
@@ -869,13 +971,33 @@ def run_simulation(idf_path, epw_path, output_dir, config, max_episodes=None, tr
     state = api.state_manager.new_state()
     controller = RLHVACController(api, state, config, training_mode=training_mode)
     controller.max_episodes = max_episodes
-    
+
+    if override_test:
+        # Fixed values chosen to be obviously different from any real EPW/schedule value
+        controller.env.weather_override = {
+            'dry_bulb':      35.0,   # °C  — expect outdoor_temp=35.0 in every step
+            'humidity':      80.0,   # %
+            'wind_speed':    1.0,    # m/s
+        }
+        controller.env.outdoor_co2_override = 650.0  # ppm — expect outdoor CO2=650 in state
+        print("\n" + "=" * 60)
+        print("[Override Test] Active — injecting fixed values every timestep:")
+        print("  weather_override : dry_bulb=35.0°C  humidity=80%  wind_speed=1.0 m/s")
+        print("  outdoor_co2_override : 650 ppm")
+        print("Verify: 'outdoor_temp' in step output should read 35.0 (not EPW value)")
+        print("=" * 60 + "\n")
+
     # Register callbacks
-    # Power cache: reads Facility Total Electricity Demand Rate while it's still valid
-    # (this variable resets before the zone timestep callback fires)
+    # 1. Pre-timestep: apply CO2 and weather overrides before zone heat-balance calculations
+    api.runtime.callback_begin_zone_timestep_before_init_heat_balance(
+        state, controller.pre_timestep_callback
+    )
+    # 2. Power cache: reads electricity/gas demand rates while still valid
+    #    (HVAC demand rate variables reset before the zone timestep end callback fires)
     api.runtime.callback_after_predictor_after_hvac_managers(
         state, controller.power_cache_callback
     )
+    # 3. Main RL loop: observe state, select action, compute reward, log
     api.runtime.callback_end_zone_timestep_after_zone_reporting(
         state, controller.timestep_callback
     )
@@ -937,6 +1059,8 @@ def main():
                         help='Save trained model after simulation')
     parser.add_argument('--episodes', type=int, default=None,
                         help='Number of episodes (default: from config duration_hours / episode_hours)')
+    parser.add_argument('--override-test', action='store_true',
+                        help='Inject fixed weather (dry_bulb=35°C, humidity=80%%) and CO2 (650 ppm) every step to verify override pipeline')
     
     args = parser.parse_args()
     
@@ -955,14 +1079,6 @@ def main():
         args.epw = str(project_root / hvac_config.config['weather_files']['summer'])
         print(f"Using weather file: {args.epw}")
     
-    # Configuration
-    config = {
-        'training_mode': args.training,
-        'model_path': args.model,
-        'save_model': args.save_model,
-        'sac_config': 'sac_config/sac_config.yaml'
-    }
-    
     # Validate inputs
     if not os.path.exists(args.idf):
         print(f"Error: IDF file not found: {args.idf}")
@@ -975,7 +1091,8 @@ def main():
     return run_simulation(
         args.idf, args.epw, args.output, args.config,
         max_episodes=args.episodes,
-        training_mode=args.training
+        training_mode=args.training,
+        override_test=args.override_test,
     )
 
 

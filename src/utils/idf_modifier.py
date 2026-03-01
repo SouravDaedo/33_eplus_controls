@@ -164,6 +164,12 @@ def create_custom_idf(
         new_lines.append('! Injected for RL: facility total electricity demand rate (W)')
         new_lines.append('  Output:Variable,*,Facility Total Electricity Demand Rate,Timestep;')
 
+    # Ensure facility natural gas demand rate is requested (for RL reward gas cost)
+    if not any('Facility Total Natural Gas Demand Rate' in line for line in new_lines):
+        new_lines.append('')
+        new_lines.append('! Injected for RL: facility total natural gas demand rate (W thermal)')
+        new_lines.append('  Output:Variable,*,Facility Total Natural Gas Demand Rate,Timestep;')
+
     # Write modified IDF
     with open(modified_idf_path, 'w') as f:
         for line in new_lines:
