@@ -1,0 +1,90 @@
+# SAC Agent Configuration
+# This file contains all hyperparameters for the Soft Actor-Critic agent
+
+# SAC-specific hyperparameters
+sac:
+  # Learning rate for all networks (actor, critics, alpha)
+  learning_rate: 0.0003
+  
+  # Discount factor for future rewards
+  gamma: 0.99
+  
+  # Soft update coefficient for target networks
+  tau: 0.005
+  
+  # Initial temperature parameter (entropy coefficient)
+  alpha: 0.2
+  
+  # How often to update target networks (in training steps)
+  target_update_interval: 1
+  
+  # Whether to automatically tune the temperature parameter
+  automatic_entropy_tuning: true
+  
+  # Batch size for training
+  batch_size: 256
+  
+  # Replay buffer size
+  memory_size: 1000000
+
+# Neural network architecture
+model:
+  # Hidden layer sizes for actor and critic networks
+  hidden_layers: [256, 256]
+  
+  # Dropout rate for regularization
+  dropout: 0.2
+  
+  # Activation function (options: relu, tanh, leaky_relu, elu, swish, gelu, selu)
+  activation: relu
+  
+  # Per-layer activations (optional, overrides 'activation' if specified)
+  # layer_activations: [relu, relu]
+
+# Training configuration
+training:
+  # Device selection: 'auto', 'cuda', or 'cpu'
+  device: auto
+  
+  # Number of training episodes
+  num_episodes: 1000
+  
+  # Maximum steps per episode
+  max_steps_per_episode: 1000
+  
+  # Number of warmup steps before training starts
+  warmup_steps: 1000
+  
+  # How often to evaluate the agent (in episodes)
+  eval_interval: 10
+  
+  # Number of evaluation episodes
+  eval_episodes: 5
+  
+  # How often to save checkpoints (in episodes)
+  save_interval: 100
+
+# Logging configuration
+logging:
+  # Whether to log training metrics
+  enabled: true
+  
+  # How often to log (in training steps)
+  log_interval: 100
+  
+  # Whether to use tensorboard
+  use_tensorboard: false
+  
+  # Log directory
+  log_dir: logs/sac
+
+# Environment configuration (for building energy control)
+environment:
+  # State space size (will be overridden by actual environment)
+  state_size: 10
+  
+  # Action space size (will be overridden by actual environment)
+  action_size: 2
+  
+  # Reward scaling factor
+  reward_scale: 1.0

@@ -57,6 +57,11 @@ python download_weather.py --lat 41.88 --lon -87.63 --tmy --output weather/chica
 │   └── ...
 ├── weather/                 # Weather files (EPW)
 ├── outputs/                 # Simulation results
+├── tests/                   # Test scripts
+│   ├── test_energy_cost.py              # Energy pricing model tests (PV + Battery + RTP)
+│   ├── test_energy_cost_live.py         # Live plotting with matplotlib
+│   ├── test_energy_cost_live_plotly.py  # Live plotting with Plotly (faster)
+│   └── test_solar_pv.py                 # Solar PV model tests
 ├── run_sim.py              # Generic simulation runner
 ├── download_weather.py     # Weather data downloader
 ├── check_engine.py         # Engine version checker

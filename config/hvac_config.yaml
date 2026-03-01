@@ -1,0 +1,128 @@
+# HVAC Control Configuration
+# This file defines state space, action space, and simulation parameters
+
+# Simulation Parameters
+simulation:
+  # Timesteps per hour (4 = 15 min, 12 = 5 min, 1 = 60 min)
+  timesteps_per_hour: 4
+  # Simulation duration in days
+  simulation_days: 1
+  # Episode duration in hours (default run uses 4 episodes = 4 hours)
+  episode_hours: 1
+  # Custom simulation period (overrides IDF run period when enabled).
+  # For zone CO2 to rise above 400 ppm, run must include occupied hours (7-18); use --episodes 8 or more.
+  custom_period:
+    enabled: true
+    # Start date (month, day)
+    start_month: 6
+    start_day: 1
+    # End date (month, day) - 1 day so we run 24h of June 1
+    end_month: 6
+    end_day: 1
+  
+# Weather file options
+weather_files:
+  default: "weather/USA_CO_Denver.Intl.AP.724650_TMY3.epw"
+  summer: "weather/atlanta_summer_2024/weather_lat33.75_lon-84.39_2024-06-01_2024-09-30.epw"
+  chicago: "weather/chicago/TMY_lat41.88_lon-87.63.epw"
+  atlanta_2023: "weather/atlanta_2023/hourly_lat33.75_lon-84.39_2023-2023.epw"
+  chicago_2020: "weather/chicago_2020/hourly_lat41.88_lon-87.63_2020-2020.epw"
+
+# State Space Configuration
+state_space:
+  # Zone temperatures
+  zone_temps:
+    count: 5
+    description: "Zone air temperatures (°C)"
+  
+  # Current weather conditions
+  current_weather:
+    - name: "outdoor_air_temperature"
+      description: "Outdoor air dry bulb temperature (°C)"
+    - name: "relative_humidity"
+      description: "Outdoor relative humidity (0-1)"
+    - name: "cloud_cover"
+      description: "Cloud cover fraction (0-1)"
+  
+  # Weather forecast (timesteps ahead)
+  weather_forecast:
+    horizon: 6  # Number of timesteps to forecast
+    variables: 3  # temp, humidity, cloud_cover
+    description: "Weather forecast for next 6 timesteps"
+  
+  # Time features
+  time_features:
+    - name: "hour_of_day"
+      description: "Hour of day normalized (0-1)"
+    - name: "day_of_week"
+      description: "Day of week normalized (0-1)"
+    - name: "month_of_year"
+      description: "Month of year normalized (0-1)"
+  
+  # Previous actions
+  previous_actions:
+    count: 3
+    description: "Previous heating offset, deadband, airflow multiplier"
+
+# Action Space Configuration
+action_space:
+  # Heating setpoint offset from base temperature
+  heating_offset:
+    min: -5.0
+    max: 5.0
+    description: "Heating setpoint offset (°C)"
+  
+  # Temperature deadband between heating and cooling
+  deadband:
+    min: 0.5
+    max: 3.0
+    description: "Temperature deadband (°C)"
+  
+  # Airflow multiplier
+  airflow_multiplier:
+    min: 0.1
+    max: 2.0
+    description: "Outdoor air flow multiplier (0.1-2.0)"
+
+# Control Parameters
+control:
+  base_temperature: 22.0  # Base temperature for setpoints (°C)
+  min_airflow: 0.01      # Minimum airflow (m³/s)
+  max_airflow: 0.1       # Maximum airflow (m³/s)
+
+# Reward Function Weights
+reward:
+  energy_weight: 0.4        # Weight for energy consumption penalty (0-1)
+  comfort_weight: 0.5       # Weight for thermal comfort penalty (0-1)
+  setpoint_weight: 0.1      # Weight for setpoint reasonableness penalty (0-1)
+  demand_weight: 0.2        # Weight for demand spike penalty (0-1)
+  comfort_threshold: 1.0     # Temperature deviation threshold (°C)
+  demand_threshold: 5.0      # Power demand threshold for penalty (kW)
+  description: "Configurable weights for reward function components"
+
+# Zone Configuration
+zones:
+  # List of zone names in the EnergyPlus model
+  names:
+    - "CORE_BOTTOM"
+    - "CORE_MIDDLE"
+    - "CORE_TOP"
+    - "PERIMETER_BOTTOM_NORTH"
+    - "PERIMETER_BOTTOM_EAST"
+    - "PERIMETER_BOTTOM_SOUTH"
+    - "PERIMETER_BOTTOM_WEST"
+    - "PERIMETER_MIDDLE_NORTH"
+    - "PERIMETER_MIDDLE_EAST"
+    - "PERIMETER_MIDDLE_SOUTH"
+    - "PERIMETER_MIDDLE_WEST"
+    - "PERIMETER_TOP_NORTH"
+    - "PERIMETER_TOP_EAST"
+    - "PERIMETER_TOP_SOUTH"
+    - "PERIMETER_TOP_WEST"
+  
+  # Zone groups for different control strategies
+  groups:
+    core: ["CORE_BOTTOM", "CORE_MIDDLE", "CORE_TOP"]
+    perimeter_bottom: ["PERIMETER_BOTTOM_NORTH", "PERIMETER_BOTTOM_EAST", "PERIMETER_BOTTOM_SOUTH", "PERIMETER_BOTTOM_WEST"]
+    perimeter_middle: ["PERIMETER_MIDDLE_NORTH", "PERIMETER_MIDDLE_EAST", "PERIMETER_MIDDLE_SOUTH", "PERIMETER_MIDDLE_WEST"]
+    perimeter_top: ["PERIMETER_TOP_NORTH", "PERIMETER_TOP_EAST", "PERIMETER_TOP_SOUTH", "PERIMETER_TOP_WEST"]
