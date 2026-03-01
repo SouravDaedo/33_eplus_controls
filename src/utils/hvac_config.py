@@ -36,20 +36,31 @@ class HVACConfig:
         forecast_vars = self.config['state_space']['weather_forecast']['variables']
         time_features_count = len(self.config['state_space']['time_features'])
         prev_actions_count = self.config['state_space']['previous_actions']['count']
+        outdoor_co2_count = self.config['state_space'].get('outdoor_co2_ppm', {}).get('count', 0)
+        zone_co2_count = self.config['state_space'].get('zone_co2_ppm', {}).get('count', 0)
         
         self.state_size = (zone_count + 
                          current_weather_count + 
                          (forecast_horizon * forecast_vars) + 
                          time_features_count + 
-                         prev_actions_count)
+                         prev_actions_count +
+                         outdoor_co2_count +
+                         zone_co2_count)
         
         # Action space dimensions
         self.action_size = len(self.config['action_space'])
         
         # Simulation parameters
         self.timesteps_per_hour = self.config['simulation']['timesteps_per_hour']
-        self.episode_hours = self.config['simulation']['episode_hours']
-        self.episode_timesteps = self.episode_hours * self.timesteps_per_hour
+        ep = self.config['simulation'].get('episode_duration_hours')
+        if isinstance(ep, list):
+            self.episode_duration_min, self.episode_duration_max = ep[0], ep[1]
+            self.episode_hours = (self.episode_duration_min + self.episode_duration_max) / 2.0
+        else:
+            self.episode_hours = self.config['simulation'].get('episode_hours', 24)
+            self.episode_duration_min = self.episode_duration_max = self.episode_hours
+        self.episode_timesteps = int(self.episode_hours * self.timesteps_per_hour)
+        self.training_window = self.config['simulation'].get('training_window', {})
         
         # Control parameters
         self.base_temperature = self.config['control']['base_temperature']
@@ -94,8 +105,16 @@ class HVACConfig:
         return self.timesteps_per_hour
     
     def get_episode_timesteps(self) -> int:
-        """Get total timesteps per episode."""
+        """Get total timesteps per episode (default/midpoint). Use set_episode_timesteps for variable length."""
         return self.episode_timesteps
+
+    def get_episode_duration_range(self) -> Tuple[float, float]:
+        """Get (min_hours, max_hours) for episode duration."""
+        return (self.episode_duration_min, self.episode_duration_max)
+
+    def get_training_window(self) -> Dict:
+        """Get training window: start_month, start_day, start_hour, end_month, end_day, end_hour."""
+        return self.training_window
     
     def get_zone_names(self) -> List[str]:
         """Get list of zone names."""

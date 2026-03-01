@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/didso/anaconda3/envs/bem/Lib/site-packages//**)"
+    ]
+  }
+}

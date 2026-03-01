@@ -3,22 +3,30 @@
 
 # Simulation Parameters
 simulation:
+  # IDF file (relative to project root); overridden by --idf if provided
+  idf_path: "energyplus/control_models/MediumOffice_IAQ.idf"
   # Timesteps per hour (4 = 15 min, 12 = 5 min, 1 = 60 min)
   timesteps_per_hour: 4
-  # Simulation duration in days
-  simulation_days: 1
-  # Episode duration in hours (default run uses 4 episodes = 4 hours)
-  episode_hours: 1
-  # Custom simulation period (overrides IDF run period when enabled).
-  # For zone CO2 to rise above 400 ppm, run must include occupied hours (7-18); use --episodes 8 or more.
+  # Training window: run RL only between this date/time and end date/time (RunPeriod = this full range)
+  training_window:
+    start_month: 4
+    start_day: 12
+    start_hour: 3          # 3 AM (hour 0-24, 24 = end of day)
+    end_month: 7
+    end_day: 30
+    end_hour: 24          # 23:59 → use 24 for end of day
+  # Episode duration in hours: [min, max]; sampled at start of each episode (e.g. 12–36 h)
+  episode_duration_hours: [12, 36]
+  # If true, a custom IDF is created with RunPeriod = training_window start to end date
   custom_period:
     enabled: true
-    # Start date (month, day)
-    start_month: 6
-    start_day: 1
-    # End date (month, day) - 1 day so we run 24h of June 1
-    end_month: 6
-    end_day: 1
+  # Outdoor air CO2 (ppm). Static value applied when creating custom IDF when outdoor_co2_csv_path is not set.
+  outdoor_co2_ppm: 400
+  # Path to CSV of outdoor CO2 (ppm) per time step. If set, custom IDF uses Schedule:File for time-varying outdoor CO2.
+  # CSV columns: month, day, hour, ppm  (hour 0-23)  OR  datetime, ppm
+  outdoor_co2_csv_path: null   # e.g. "data/outdoor_co2_2023.csv"
+  # When using outdoor_co2_csv_path: fallback ppm for missing hours when building the 8760 schedule.
+  outdoor_co2_fallback_ppm: 400
   
 # Weather file options
 weather_files:
@@ -63,6 +71,14 @@ state_space:
   previous_actions:
     count: 3
     description: "Previous heating offset, deadband, airflow multiplier"
+  
+  # CO2 (ppm) – outdoor and zone concentrations
+  outdoor_co2_ppm:
+    count: 1
+    description: "Outdoor air CO2 concentration (ppm)"
+  zone_co2_ppm:
+    count: 5
+    description: "Zone air CO2 concentration (ppm) for controlled zones; same order as zone_temps"
 
 # Action Space Configuration
 action_space:
@@ -74,8 +90,8 @@ action_space:
   
   # Temperature deadband between heating and cooling
   deadband:
-    min: 0.5
-    max: 3.0
+    min: 2
+    max: 10.0
     description: "Temperature deadband (°C)"
   
   # Airflow multiplier
@@ -93,10 +109,25 @@ control:
 # Reward Function Weights
 reward:
   energy_weight: 0.4        # Weight for energy consumption penalty (0-1)
+  # Energy cost = (power_W / 1000) * dt_hours * price; price from realtime_price or energy_price_per_kwh
+  energy_price_per_kwh: 0.1 # Default/fallback price ($/kWh) when realtime_price is disabled
+  # Real-time price: used in reward and stored in log (energy_price_used)
+  realtime_price:
+    enabled: false         # Set true to use time-varying price
+    type: "constant"       # "constant" | "tou"
+    constant_price: 0.1    # When type is constant ($/kWh)
+    tou:                   # When type is tou (hours 0-23)
+      peak:    { hours: [12, 13, 14, 15, 16, 17, 18], price: 0.15 }
+      off_peak: { hours: [0, 1, 2, 3, 4, 5, 6, 22, 23], price: 0.08 }
+      mid:     { price: 0.10 }
   comfort_weight: 0.5       # Weight for thermal comfort penalty (0-1)
   setpoint_weight: 0.1      # Weight for setpoint reasonableness penalty (0-1)
   demand_weight: 0.2        # Weight for demand spike penalty (0-1)
-  comfort_threshold: 1.0     # Temperature deviation threshold (°C)
+  # Thermal comfort model: "temperature" = penalty from zone temp vs base_temp ± threshold; "ppd" = penalty from Fanger PPD
+  thermal_comfort_model: "temperature"   # "temperature" | "ppd"
+  comfort_threshold: 1.0     # Temperature deviation threshold (°C) (used when thermal_comfort_model is temperature)
+  ppd_acceptable_max: 10.0    # PPD (%) above which penalty applies (used when thermal_comfort_model is ppd)
+  ppd_penalty_scale: 0.01    # Penalty per zone = max(0, PPD - ppd_acceptable_max) * ppd_penalty_scale, then * comfort_weight
   demand_threshold: 5.0      # Power demand threshold for penalty (kW)
   description: "Configurable weights for reward function components"
 

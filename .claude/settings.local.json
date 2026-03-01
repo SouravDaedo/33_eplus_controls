@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python -c \"from pyenergyplus.api import EnergyPlusAPI; print\\(''OK''\\)\")"
+      "Bash(python -c \"from pyenergyplus.api import EnergyPlusAPI; print\\(''OK''\\)\")",
+      "Bash(KMP_DUPLICATE_LIB_OK=TRUE /c/Users/didso/anaconda3/envs/bem/python.exe rl_hvac_control.py --config ../config/hvac_config.yaml --episodes 1)",
+      "Bash(echo \"Exit: $?\")"
     ]
   }
 }

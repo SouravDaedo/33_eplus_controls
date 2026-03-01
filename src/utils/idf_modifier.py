@@ -3,14 +3,25 @@ Utility functions for modifying EnergyPlus IDF files for custom simulation perio
 """
 
 import os
+import re
 import shutil
 from datetime import datetime, timedelta
 
 
-def create_custom_idf(original_idf_path, start_month, start_day, end_month, end_day, output_dir=None):
+def create_custom_idf(
+    original_idf_path,
+    start_month,
+    start_day,
+    end_month,
+    end_day,
+    output_dir=None,
+    outdoor_co2_ppm=None,
+    outdoor_co2_csv_path=None,
+    outdoor_co2_fallback_ppm=400,
+):
     """
     Create a modified IDF file with custom simulation period.
-    
+
     Args:
         original_idf_path: Path to original IDF file
         start_month: Start month (1-12)
@@ -18,36 +29,59 @@ def create_custom_idf(original_idf_path, start_month, start_day, end_month, end_
         end_month: End month (1-12)
         end_day: End day (1-31)
         output_dir: Directory to save modified IDF (defaults to same as original)
-    
+        outdoor_co2_ppm: If set (and outdoor_co2_csv_path not set), constant outdoor CO2 (ppm)
+        outdoor_co2_csv_path: If set, use time-varying outdoor CO2 from CSV (Schedule:File)
+        outdoor_co2_fallback_ppm: Fallback ppm when building schedule from CSV (missing hours)
+
     Returns:
         Path to modified IDF file
     """
     if output_dir is None:
         output_dir = os.path.dirname(original_idf_path)
-    
+
     # Read original IDF
     with open(original_idf_path, 'r') as f:
         idf_content = f.read()
-    
+
     # Debug: Count original SizingPeriod objects
     original_sizing = [line for line in idf_content.split('\n') if 'SizingPeriod' in line]
     print(f"Original IDF has {len(original_sizing)} SizingPeriod objects")
-    
+
     # Create output filename
     base_name = os.path.splitext(os.path.basename(original_idf_path))[0]
     modified_idf_path = os.path.join(output_dir, f"{base_name}_custom_{start_month}{start_day:02d}_to_{end_month}{end_day:02d}.idf")
-    
-    # Find and replace RunPeriod section
+
+    # Time-varying outdoor CO2: write 8760-hour schedule file and we'll replace Schedule:Constant with Schedule:File
+    schedule_file_name = None
+    if outdoor_co2_csv_path:
+        try:
+            from src.utils.outdoor_co2_schedule import write_ep_outdoor_co2_schedule
+            schedule_file_name = "outdoor_co2_schedule.csv"
+            out_schedule_path = os.path.join(output_dir, schedule_file_name)
+            write_ep_outdoor_co2_schedule(
+                outdoor_co2_csv_path,
+                out_schedule_path,
+                fallback_ppm=outdoor_co2_fallback_ppm,
+                year=2023,
+            )
+            print(f"Outdoor CO2: time-varying from {outdoor_co2_csv_path} -> {schedule_file_name}")
+        except Exception as e:
+            print(f"Warning: could not build outdoor CO2 schedule from CSV: {e}; using constant.")
+            schedule_file_name = None
+
+    # Find and replace RunPeriod section; optionally replace or override outdoor CO2 schedule
     lines = idf_content.split('\n')
     new_lines = []
     in_runperiod = False
     runperiod_found = False
-    
-    for line in lines:
+    constant_block_buffer = []  # collect Schedule:Constant + 3 lines, then decide
+
+    i = 0
+    while i < len(lines):
+        line = lines[i]
         if line.strip().startswith('RunPeriod,'):
             in_runperiod = True
             runperiod_found = True
-            # Replace with custom run period
             new_lines.extend([
                 '  RunPeriod,',
                 f'    CUSTOM_PERIOD,          !- Name',
@@ -65,40 +99,94 @@ def create_custom_idf(original_idf_path, start_month, start_day, end_month, end_
                 '    Yes;                     !- Use Weather File Snow Indicators',
                 ''
             ])
-        elif in_runperiod and line.strip().endswith(';'):
-            # End of RunPeriod block - skip this line since we already added the semicolon
-            in_runperiod = False
+            i += 1
         elif in_runperiod:
-            # Skip lines within the original RunPeriod block
+            if 'Use Weather File Snow Indicators' in line:
+                in_runperiod = False
+            i += 1
+            continue
+        elif line.strip().startswith('Schedule:Constant,'):
+            # Buffer this line and the next 3 to see if it's Outdoor CO2 Schedule
+            constant_block_buffer = [line]
+            i += 1
+            for _ in range(3):
+                if i < len(lines):
+                    constant_block_buffer.append(lines[i])
+                    i += 1
+            # Check if name line (second line) contains "Outdoor CO2 Schedule"
+            name_line = constant_block_buffer[1] if len(constant_block_buffer) > 1 else ''
+            is_outdoor_co2 = 'Outdoor CO2 Schedule' in name_line
+            if is_outdoor_co2 and schedule_file_name:
+                new_lines.append('  Schedule:File,')
+                new_lines.append('    Outdoor CO2 Schedule,    !- Name')
+                new_lines.append('    ,                        !- Schedule Type Limits Name')
+                new_lines.append(f'    {schedule_file_name},    !- File Name')
+                new_lines.append('    1,                        !- Column Number')
+                new_lines.append('    0,                        !- Rows to Skip at Top')
+                new_lines.append('    8760,                     !- Number of Hours of Data')
+                new_lines.append('    Comma;                    !- Column Separator')
+            else:
+                # Emit block; override hourly value if constant outdoor CO2 and this is the outdoor schedule
+                for j, bline in enumerate(constant_block_buffer):
+                    if is_outdoor_co2 and outdoor_co2_ppm is not None and '!- Hourly Value {ppm}' in bline:
+                        m = re.match(r'^(\s*)\d+;(.*)$', bline)
+                        if m:
+                            bline = m.group(1) + str(int(outdoor_co2_ppm)) + ';' + m.group(2)
+                    new_lines.append(bline)
+            constant_block_buffer = []
             continue
         else:
-            # Keep all other lines (including SizingPeriod objects)
+            if outdoor_co2_ppm is not None and not outdoor_co2_csv_path and '!- Hourly Value {ppm}' in line:
+                m = re.match(r'^(\s*)\d+;(.*)$', line)
+                if m:
+                    line = m.group(1) + str(int(outdoor_co2_ppm)) + ';' + m.group(2)
             new_lines.append(line)
-    
+            i += 1
+
     if not runperiod_found:
         raise ValueError("No RunPeriod found in IDF file")
-    
+
     # Check if SizingPeriod objects are preserved
     sizing_periods = [line for line in new_lines if 'SizingPeriod:' in line]
     print(f"Preserved {len(sizing_periods)} SizingPeriod objects")
     if sizing_periods:
         print(f"First SizingPeriod: {sizing_periods[0].strip()}")
     else:
-        # Check for any SizingPeriod lines
         all_sizing = [line for line in new_lines if 'SizingPeriod' in line]
         print(f"Found {len(all_sizing)} lines with 'SizingPeriod'")
         if all_sizing:
             print(f"First SizingPeriod line: {all_sizing[0].strip()}")
-    
+
+    # Ensure facility electricity demand rate is requested (for RL reward energy cost)
+    # Note: EnergyPlus 23.2+ uses "Facility Total Electricity Demand Rate" (not "Electric Demand Power")
+    if not any('Facility Total Electricity Demand Rate' in line for line in new_lines):
+        new_lines.append('')
+        new_lines.append('! Injected for RL: facility total electricity demand rate (W)')
+        new_lines.append('  Output:Variable,*,Facility Total Electricity Demand Rate,Timestep;')
+
     # Write modified IDF
     with open(modified_idf_path, 'w') as f:
         for line in new_lines:
             f.write(line + '\n')
-    
+
     print(f"Created custom IDF: {modified_idf_path}")
     print(f"Simulation period: {start_month}/{start_day} to {end_month}/{end_day}")
-    
+    if outdoor_co2_csv_path and schedule_file_name:
+        print(f"Outdoor CO2: time-varying from CSV ({schedule_file_name})")
+    elif outdoor_co2_ppm is not None:
+        print(f"Outdoor CO2 set to {outdoor_co2_ppm} ppm")
+
     return modified_idf_path
+
+
+def end_date_from_duration(start_month, start_day, duration_hours, year=2023):
+    """
+    Compute end (month, day) from start date and duration in hours.
+    RunPeriod must span at least duration_hours; we use whole days.
+    """
+    start = datetime(year, start_month, start_day)
+    end = start + timedelta(hours=int(duration_hours))
+    return end.month, end.day
 
 
 def calculate_simulation_days(start_month, start_day, end_month, end_day):
