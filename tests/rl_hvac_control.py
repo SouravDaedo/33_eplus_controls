@@ -420,13 +420,13 @@ class HVACEnvironment:
         action_bounds = self.hvac_config.get_action_bounds()
         def scale(a, low, high):
             return low + (np.clip(a, -1.0, 1.0) + 1.0) / 2.0 * (high - low)
-        heating_sp_offset = scale(action[0], action_bounds['heating_offset'][0], action_bounds['heating_offset'][1])
+        sp_offset = scale(action[0], action_bounds['sp_offset'][0], action_bounds['sp_offset'][1])
         deadband = scale(action[1], action_bounds['deadband'][0], action_bounds['deadband'][1])
         airflow_mult = scale(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1])
         
         # Calculate setpoints
-        heating_sp = self.base_temp + heating_sp_offset - deadband/2
-        cooling_sp = self.base_temp + heating_sp_offset + deadband/2
+        heating_sp = self.base_temp + sp_offset - deadband/2
+        cooling_sp = self.base_temp + sp_offset + deadband/2
         
         # Apply to all zones
         for _, handles in self.handles['zones'].items():
@@ -505,10 +505,10 @@ class HVACEnvironment:
         action_bounds = self.hvac_config.get_action_bounds()
         def _scale(a, lo, hi):
             return lo + (np.clip(a, -1.0, 1.0) + 1.0) / 2.0 * (hi - lo)
-        heating_sp_offset = _scale(action[0], action_bounds['heating_offset'][0], action_bounds['heating_offset'][1])
+        sp_offset = _scale(action[0], action_bounds['sp_offset'][0], action_bounds['sp_offset'][1])
         deadband = _scale(action[1], action_bounds['deadband'][0], action_bounds['deadband'][1])
         setpoint_penalty = 0.0
-        if abs(heating_sp_offset) > 2.0:
+        if abs(sp_offset) > 2.0:
             setpoint_penalty += 0.1
         if deadband < 1.0:
             setpoint_penalty += 0.05
@@ -833,10 +833,12 @@ class RLHVACController:
         action_bounds = self.env.hvac_config.get_action_bounds()
         def _scale(a, lo, hi):
             return lo + (np.clip(a, -1.0, 1.0) + 1.0) / 2.0 * (hi - lo)
-        heating_sp_offset = _scale(action[0], action_bounds['heating_offset'][0], action_bounds['heating_offset'][1])
+        sp_offset = _scale(action[0], action_bounds['sp_offset'][0], action_bounds['sp_offset'][1])
         deadband = _scale(action[1], action_bounds['deadband'][0], action_bounds['deadband'][1])
         airflow_mult = _scale(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1])
         airflow_actual = self.env.min_airflow + (self.env.max_airflow - self.env.min_airflow) * airflow_mult
+        htg_sp = self.env.base_temp + sp_offset - deadband / 2
+        clg_sp = self.env.base_temp + sp_offset + deadband / 2
         
         # States: zone temps (first 5), then outdoor temp
         zone_count = self.env.hvac_config.config['state_space']['zone_temps']['count']
@@ -846,7 +848,7 @@ class RLHVACController:
         
         # Print: time, step; actual actions (raw + scaled); states; reward; then blank line
         print(f"{datetime_str} | Step {episode_step:3d}")
-        print(f"   Actions: raw [{action[0]:+.2f}, {action[1]:+.2f}, {action[2]:+.2f}]  ->  heating_offset={heating_sp_offset:+5.2f}°C  deadband={deadband:4.2f}°C  airflow={airflow_actual:.4f} m³/s")
+        print(f"   Actions: raw [{action[0]:+.2f}, {action[1]:+.2f}, {action[2]:+.2f}]  ->  sp_offset={sp_offset:+5.2f}°C  htg_sp={htg_sp:.1f}°C  clg_sp={clg_sp:.1f}°C  deadband={deadband:4.2f}°C  airflow={airflow_actual:.4f} m³/s")
         print(f"   States:  zone_temps=[{zone_str}]°C  outdoor_temp={outdoor_temp:5.1f}°C")
         print(f"   Reward: {reward:7.3f}  episode_total={self.env.episode_reward:7.3f}  |  elec_cost[$]={energy_cost:.4f}  gas_cost[$]={gas_cost:.4f}  comfort={comfort_penalty:.4f}  setpoint={setpoint_penalty:.4f}  demand_penalty[$]={demand_penalty:.4f}  total_cost={total_cost:.4f}  |  price[$/kWh]={energy_price_used:.3f}  elec[kWh]={energy_kwh:.4f}  elec[kW]={current_power/1000:.2f}  gas[kWh]={gas_kwh:.4f}  gas[kW]={current_gas_power/1000:.2f}")
         print()

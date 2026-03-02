@@ -82,11 +82,11 @@ state_space:
 
 # Action Space Configuration
 action_space:
-  # Heating setpoint offset from base temperature
-  heating_offset:
+  # Comfort band center offset from base temperature (shifts both heating and cooling setpoints equally)
+  sp_offset:
     min: -5.0
     max: 5.0
-    description: "Heating setpoint offset (°C)"
+    description: "Setpoint offset — shifts heating and cooling setpoints equally (°C)"
   
   # Temperature deadband between heating and cooling
   deadband:

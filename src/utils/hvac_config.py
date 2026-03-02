@@ -71,9 +71,9 @@ class HVACConfig:
         
         # Action bounds
         self.action_bounds = {
-            'heating_offset': (
-                self.config['action_space']['heating_offset']['min'],
-                self.config['action_space']['heating_offset']['max']
+            'sp_offset': (
+                self.config['action_space']['sp_offset']['min'],
+                self.config['action_space']['sp_offset']['max']
             ),
             'deadband': (
                 self.config['action_space']['deadband']['min'],

@@ -104,13 +104,13 @@ class MockHVACEnvironment:
         """Apply action from RL agent (simulated)."""
         # Parse action using config bounds
         action_bounds = self.hvac_config.get_action_bounds()
-        heating_sp_offset = np.clip(action[0], action_bounds['heating_offset'][0], action_bounds['heating_offset'][1])
+        sp_offset = np.clip(action[0], action_bounds['sp_offset'][0], action_bounds['sp_offset'][1])
         deadband = np.clip(action[1], action_bounds['deadband'][0], action_bounds['deadband'][1])
         airflow_mult = np.clip(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1])
         
         # Calculate setpoints
-        heating_sp = self.base_temp + heating_sp_offset - deadband/2
-        cooling_sp = self.base_temp + heating_sp_offset + deadband/2
+        heating_sp = self.base_temp + sp_offset - deadband/2
+        cooling_sp = self.base_temp + sp_offset + deadband/2
         
         # Store action
         self.current_action = action
@@ -120,14 +120,14 @@ class MockHVACEnvironment:
     def calculate_reward(self, prev_state, action, curr_state):
         """Calculate reward based on energy efficiency and thermal comfort."""
         # Simulate energy consumption based on action
-        heating_sp_offset = action[0]
+        sp_offset = action[0]
         deadband = action[1]
         airflow_mult = action[2]
         
         # Energy cost (higher airflow and tighter deadband = more energy)
         energy_cost = 0.1 * airflow_mult + 0.05 * (3.0 - deadband)
-        if abs(heating_sp_offset) > 2.0:
-            energy_cost += 0.1 * abs(heating_sp_offset - 2.0)
+        if abs(sp_offset) > 2.0:
+            energy_cost += 0.1 * abs(sp_offset - 2.0)
         
         # Thermal comfort reward
         zone_temps = curr_state[:5]
@@ -139,7 +139,7 @@ class MockHVACEnvironment:
         
         # Setpoint reasonableness penalty
         setpoint_penalty = 0.0
-        if abs(heating_sp_offset) > 2.0:
+        if abs(sp_offset) > 2.0:
             setpoint_penalty += 0.1
         if deadband < 1.0:
             setpoint_penalty += 0.05
