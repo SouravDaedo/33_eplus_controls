@@ -28,6 +28,8 @@ data/
 outputs/
 batch_outputs/
 *.idf
+# Track control model IDFs (RL/base models)
+!energyplus/control_models/*.idf
 *.epw
 *.eso
 *.mtr
