@@ -2,6 +2,8 @@
 
 Reinforcement learning–based HVAC control using the EnergyPlus Python API. Includes a full SAC agent, real-time energy pricing, gas cost tracking, CO₂ monitoring, and programmable weather/CO₂ overrides — all driven from Python with no manual EnergyPlus installation.
 
+**EnergyPlus version:** The control models in `energyplus/control_models/` (e.g. `MediumOffice_IAQ.idf`) are for **EnergyPlus 23.2**. Use that version of the EnergyPlus Python API for compatibility. Other versions may work if the IDF is upgraded or downgraded with the EnergyPlus IDFVersionUpdater/Transition tools.
+
 ---
 
 ## Quick Start
@@ -17,12 +19,34 @@ Run with `run_rl_hvac.bat` from the project root for a one-click launch.
 
 ---
 
+## Plotting simulation results
+
+After running the RL HVAC simulation, results are written to a CSV (default: `outputs/rl_hvac_control/rl_hvac_log.csv`; override with `--output-dir`).
+
+**To plot:**
+
+1. Run the simulation at least once:
+   ```bash
+   python tests/rl_hvac_control.py --config config/hvac_config.yaml --episodes 1
+   ```
+2. Open the IAQ results notebook and run all cells:
+   - **Jupyter:** Open `tests/plot_iaq_results.ipynb` (from project root or from `tests/`).
+   - The notebook loads `outputs/rl_hvac_control/rl_hvac_log.csv` and plots:
+     - CO₂ concentration (by zone and over time)
+     - Zone temperatures and thermal comfort (PPD/PMV)
+     - Reward components (energy cost, comfort, setpoint, demand)
+     - Optional: choose a single episode via `EPISODE_TO_PLOT` (int, list, or `None` for all).
+
+If you used a custom output directory, set `log_path` in the notebook’s “Load Data” cell to that path (e.g. `project_root / 'outputs' / 'my_run' / 'rl_hvac_log.csv'`).
+
+---
+
 ## Directory Structure
 
 ```
 eplus_controls/
 ├── config/                  # Simulation and RL configuration
-├── energyplus/              # IDF building models
+├── energyplus/              # IDF building models (EnergyPlus 23.2)
 ├── src/                     # Core library code
 │   ├── agents/              # RL agents (SAC, DQN)
 │   ├── utils/               # Helpers (config, IDF, pricing, weather)
@@ -45,7 +69,8 @@ eplus_controls/
 | `run_rl_hvac.bat` | One-click launcher — activates conda env and runs the RL HVAC simulation |
 | `tests/rl_hvac_control.py` | **Main simulation script** — EnergyPlus + SAC agent loop (see below) |
 | `tests/test_rl_hvac_simple.py` | Mock environment test — runs the RL agent without EnergyPlus (fast unit test) |
-| `plot_results.ipynb` | Jupyter notebook — plots reward breakdown, energy, temperatures from the output CSV |
+| `tests/plot_iaq_results.ipynb` | **Plot RL HVAC results** — CO₂, zone temps, reward components, PPD/PMV (uses `outputs/rl_hvac_control/rl_hvac_log.csv`) |
+| `plot_results.ipynb` | Plots external-controller simulation — temperatures, power, setpoints (uses `outputs/…/simulation_log.csv`) |
 | `download_weather.py` | Download EPW weather files from Open-Meteo or PVGIS |
 | `integrated_simulation.py` | Combines building + solar PV + battery + pricing in a single simulation |
 | `battery_model.py` | Configurable battery energy storage model (charge/discharge state machine) |
