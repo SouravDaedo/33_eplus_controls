@@ -4,7 +4,7 @@
 # Simulation Parameters
 simulation:
   # IDF file (relative to project root); overridden by --idf if provided
-  idf_path: "energyplus/control_models/MediumOffice_IAQ.idf"
+  idf_path: "energyplus/control_models/MediumOffice_IAQ_25_2.idf"
   # Timesteps per hour (4 = 15 min, 12 = 5 min, 1 = 60 min)
   timesteps_per_hour: 4
   # Training window: run RL only between this date/time and end date/time (RunPeriod = this full range)
@@ -16,7 +16,7 @@ simulation:
     end_day: 30
     end_hour: 24          # 23:59 → use 24 for end of day
   # Episode duration in hours: [min, max]; sampled at start of each episode (e.g. 12–36 h)
-  episode_duration_hours: [12, 36]
+  episode_duration_hours: [24, 24]
   # If true, a custom IDF is created with RunPeriod = training_window start to end date
   custom_period:
     enabled: true
@@ -158,18 +158,3 @@ zones:
     perimeter_bottom: ["PERIMETER_BOTTOM_NORTH", "PERIMETER_BOTTOM_EAST", "PERIMETER_BOTTOM_SOUTH", "PERIMETER_BOTTOM_WEST"]
     perimeter_middle: ["PERIMETER_MIDDLE_NORTH", "PERIMETER_MIDDLE_EAST", "PERIMETER_MIDDLE_SOUTH", "PERIMETER_MIDDLE_WEST"]
     perimeter_top: ["PERIMETER_TOP_NORTH", "PERIMETER_TOP_EAST", "PERIMETER_TOP_SOUTH", "PERIMETER_TOP_WEST"]
-
-# State Normalization (min-max scaling to [0, 1])
-normalization:
-  enabled: true
-  bounds:
-    zone_temp:     [10.0,  40.0]   # °C
-    oat:           [-20.0, 50.0]   # °C
-    humidity:      [0.0,   100.0]  # %
-    sky_temp:      [-30.0, 40.0]   # °C
-    hour_of_day:   [0.0,   1.0]    # already [0,1]
-    day_of_week:   [0.0,   1.0]    # already [0,1]
-    month_of_year: [0.0,   1.0]    # already [0,1]
-    prev_action:   [-1.0,  1.0]    # tanh output
-    outdoor_co2:   [300.0, 1200.0] # ppm
-    zone_co2:      [300.0, 2000.0] # ppm

@@ -13,6 +13,7 @@ from collections import deque
 import yaml
 from typing import Tuple, List, Dict
 import os
+from src.agents.device import get_torch_device
 
 class Actor(nn.Module):
     """Actor network for SAC - outputs continuous actions."""
@@ -195,14 +196,7 @@ class SACAgent:
         
         # Device configuration
         device_config = self.config.get('training', {}).get('device', 'auto')
-        if device_config == 'auto':
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        elif device_config == 'cuda':
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA requested but not available!")
-            self.device = torch.device("cuda")
-        else:
-            self.device = torch.device("cpu")
+        self.device = get_torch_device(device_config)
         
         # SAC hyperparameters
         sac_config = self.config.get('sac', {})

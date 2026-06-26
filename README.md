@@ -2,7 +2,26 @@
 
 Reinforcement learning–based HVAC control using the EnergyPlus Python API. Includes a full SAC agent, real-time energy pricing, gas cost tracking, CO₂ monitoring, and programmable weather/CO₂ overrides — all driven from Python with no manual EnergyPlus installation.
 
-**EnergyPlus version:** The control models in `energyplus/control_models/` (e.g. `MediumOffice_IAQ.idf`) are for **EnergyPlus 23.2**. Use that version of the EnergyPlus Python API for compatibility. Other versions may work if the IDF is upgraded or downgraded with the EnergyPlus IDFVersionUpdater/Transition tools.
+## Version Information
+
+Current tested setup, checked on 2026-06-24:
+
+| Component | Version | Notes |
+|-----------|---------|-------|
+| `pyenergyplus-lbnl` package | `26.1.0` | Latest PyPI version at the time checked |
+| EnergyPlus engine used in local simulation | `25.2.0-cf7368216c` | Printed by EnergyPlus when `tests/rl_hvac_control.py` starts |
+| Control IDF model version | `23.2` | `energyplus/control_models/MediumOffice_IAQ.idf` declares `Version,23.2;` |
+| Generated custom IDF version | `23.2` | Auto-generated under `outputs/rl_hvac_control/`; patched for compatibility with the installed engine |
+
+The source control models in `energyplus/control_models/` are EnergyPlus 23.2 IDFs. When running with newer EnergyPlus engines, `src/utils/idf_modifier.py` applies small compatibility fixes during custom IDF generation. A fully upgraded 25.2 IDF would still require the official EnergyPlus IDFVersionUpdater/Transition tools.
+
+To verify your local versions:
+
+```bash
+python -c "from pyenergyplus.api import EnergyPlusAPI; api = EnergyPlusAPI(); print(api.functional.ep_version())"
+grep "Version," energyplus/control_models/MediumOffice_IAQ.idf
+grep "Version," outputs/rl_hvac_control/MediumOffice_IAQ_custom_412_to_730.idf
+```
 
 ---
 
@@ -140,6 +159,49 @@ python rl_hvac_control.py \
   --override-test   # inject dry_bulb=35°C, CO₂=650ppm to verify override pipeline
 ```
 
+**Example: fixed 24-hour simulation**
+
+Use `config/hvac_config_24h.yaml` for a fixed-duration run with the upgraded EnergyPlus 25.2 model:
+
+```bash
+python tests/rl_hvac_control.py \
+  --config config/hvac_config_24h.yaml \
+  --epw weather/chicago/TMY_lat41.88_lon-87.63.epw \
+  --output outputs/rl_hvac_24h \
+  --episodes 1
+```
+
+Add `--live-plot` to show a running dashboard while the simulation logs timesteps:
+
+```bash
+python tests/rl_hvac_control.py \
+  --config config/hvac_config_24h.yaml \
+  --epw weather/chicago/TMY_lat41.88_lon-87.63.epw \
+  --output outputs/rl_hvac_24h \
+  --episodes 1 \
+  --live-plot \
+  --live-plot-hold
+```
+
+The live plot shows average zone temperature, outdoor temperature, effective heating/cooling setpoints, electricity/gas power, reward, cumulative episode reward, and average zone CO₂. A final snapshot is saved as `rl_hvac_live_plot.png` in the output directory.
+
+To choose the start day/hour and duration, edit these fields in `config/hvac_config_24h.yaml`:
+
+```yaml
+simulation:
+  idf_path: "energyplus/control_models/MediumOffice_IAQ_25_2.idf"
+  training_window:
+    start_month: 6
+    start_day: 6
+    start_hour: 13
+    end_month: 6
+    end_day: 7
+    end_hour: 13
+  episode_duration_hours: [24, 24]
+```
+
+This example runs one 24-hour episode from June 6 at 13:00 through June 7 at 13:00. If the training window is wider than the duration, the controller samples the episode start randomly inside that window.
+
 **Outputs** (written to `--output` directory, default `outputs/rl_hvac_control/`):
 
 | File | Contents |
@@ -243,6 +305,6 @@ conda activate bem
 pip install pyenergyplus-lbnl pandas numpy torch pyyaml
 ```
 
-The `pyenergyplus-lbnl` package bundles EnergyPlus 23.2 — no separate installation needed.
+The `pyenergyplus-lbnl` package bundles the EnergyPlus engine used by the Python API, so no separate desktop EnergyPlus installation is needed for this workflow. The installed package version and the EnergyPlus engine version are separate values; see "Version Information" above.
 
 Set `KMP_DUPLICATE_LIB_OK=TRUE` if running on Windows with PyTorch (already set in `run_rl_hvac.bat`).

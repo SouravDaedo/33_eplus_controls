@@ -131,6 +131,52 @@ class HVACConfig:
     def get_reward_weights(self) -> Dict[str, float]:
         """Get reward function weights."""
         return self.reward_weights
+
+    def is_normalization_enabled(self) -> bool:
+        """Return True if min-max state normalization is enabled."""
+        return self.config.get('normalization', {}).get('enabled', False)
+
+    def get_state_normalization_bounds(self):
+        """Return (mins, maxs) numpy arrays matching the state vector layout.
+
+        Each element corresponds to one state feature in the same order as get_current_state().
+        Used for min-max normalization: normalized = clip((x - min) / (max - min), 0, 1).
+        """
+        import numpy as np
+        b = self.config.get('normalization', {}).get('bounds', {})
+
+        def _b(key, default_min, default_max, count=1):
+            lo, hi = b.get(key, [default_min, default_max])
+            return [(lo, hi)] * count
+
+        ss = self.config['state_space']
+        zone_count  = ss['zone_temps']['count']
+        horizon     = ss['weather_forecast']['horizon']
+        fvars       = ss['weather_forecast']['variables']
+        n_time      = len(ss['time_features'])
+        n_prev      = ss['previous_actions']['count']
+        n_out_co2   = ss.get('outdoor_co2_ppm', {}).get('count', 0)
+        n_zone_co2  = ss.get('zone_co2_ppm',    {}).get('count', 0)
+
+        pairs = (
+            _b('zone_temp',     10.0,  40.0,  zone_count) +
+            _b('oat',          -20.0,  50.0,  1) +
+            _b('humidity',       0.0, 100.0,  1) +
+            _b('sky_temp',     -30.0,  40.0,  1) +
+            _b('oat',          -20.0,  50.0,  horizon) +    # forecast oat
+            _b('humidity',       0.0, 100.0,  horizon) +    # forecast humidity
+            _b('sky_temp',     -30.0,  40.0,  horizon) +    # forecast sky_temp
+            _b('hour_of_day',    0.0,   1.0,  1) +
+            _b('day_of_week',    0.0,   1.0,  1) +
+            _b('month_of_year',  0.0,   1.0,  1) +
+            _b('prev_action',   -1.0,   1.0,  n_prev) +
+            _b('outdoor_co2',  300.0, 1200.0, n_out_co2) +
+            _b('zone_co2',     300.0, 2000.0, n_zone_co2)
+        )
+
+        mins = np.array([p[0] for p in pairs], dtype=np.float32)
+        maxs = np.array([p[1] for p in pairs], dtype=np.float32)
+        return mins, maxs
     
     def print_config_summary(self):
         """Print configuration summary."""

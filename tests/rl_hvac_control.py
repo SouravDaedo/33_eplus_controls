@@ -85,6 +85,131 @@ def _sample_random_start_in_window(window, after_month=None, after_day=None, aft
     return (from_dt.month, from_dt.day, from_dt.hour)
 
 
+class LiveRLPlotter:
+    """Small matplotlib dashboard updated from the EnergyPlus callback."""
+
+    def __init__(self, output_dir, update_every=1):
+        self.update_every = max(1, int(update_every))
+        self.step_count = 0
+        mpl_cache_dir = Path(output_dir) / ".matplotlib-cache"
+        mpl_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache_dir))
+
+        try:
+            import matplotlib.pyplot as plt
+        except ImportError as exc:
+            raise RuntimeError(
+                "Live plotting requires matplotlib. Install it in the active environment."
+            ) from exc
+
+        self.plt = plt
+        plt.ion()
+        self.fig, self.axes = plt.subplots(2, 2, figsize=(12, 8), num="RL HVAC Live Plot")
+        self.fig.suptitle("RL HVAC Simulation Live Plot")
+
+        self.series = {
+            "step": [],
+            "avg_zone_temp": [],
+            "outdoor_temp": [],
+            "electric_kw": [],
+            "gas_kw": [],
+            "reward": [],
+            "episode_reward": [],
+            "avg_co2": [],
+            "heating_setpoint": [],
+            "cooling_setpoint": [],
+        }
+
+        self.lines = {}
+        self._setup_axes()
+
+    def _setup_axes(self):
+        ax_temp, ax_power, ax_reward, ax_co2 = self.axes.ravel()
+
+        self.lines["avg_zone_temp"], = ax_temp.plot([], [], label="Avg Zone Temp", color="tab:blue")
+        self.lines["outdoor_temp"], = ax_temp.plot([], [], label="Outdoor Temp", color="tab:orange")
+        self.lines["heating_setpoint"], = ax_temp.plot(
+            [], [], label="Heating Setpoint", color="tab:red", linestyle="--"
+        )
+        self.lines["cooling_setpoint"], = ax_temp.plot(
+            [], [], label="Cooling Setpoint", color="tab:green", linestyle="--"
+        )
+        ax_temp.set_ylabel("Temperature (C)")
+        ax_temp.legend(loc="best")
+        ax_temp.grid(True, alpha=0.3)
+
+        self.lines["electric_kw"], = ax_power.plot([], [], label="Electric", color="tab:red")
+        self.lines["gas_kw"], = ax_power.plot([], [], label="Gas", color="tab:green")
+        ax_power.set_ylabel("Power (kW)")
+        ax_power.legend(loc="best")
+        ax_power.grid(True, alpha=0.3)
+
+        self.lines["reward"], = ax_reward.plot([], [], label="Step Reward", color="tab:purple")
+        self.lines["episode_reward"], = ax_reward.plot([], [], label="Episode Reward", color="tab:brown")
+        ax_reward.set_xlabel("Timestep")
+        ax_reward.set_ylabel("Reward")
+        ax_reward.legend(loc="best")
+        ax_reward.grid(True, alpha=0.3)
+
+        self.lines["avg_co2"], = ax_co2.plot([], [], label="Avg Zone CO2", color="tab:cyan")
+        ax_co2.set_xlabel("Timestep")
+        ax_co2.set_ylabel("CO2 (ppm)")
+        ax_co2.legend(loc="best")
+        ax_co2.grid(True, alpha=0.3)
+
+        self.fig.tight_layout()
+        self.fig.canvas.draw_idle()
+        self.plt.pause(0.001)
+
+    def update(self, log_entry):
+        self.step_count += 1
+
+        step = len(self.series["step"]) + 1
+        self.series["step"].append(step)
+        self.series["avg_zone_temp"].append(float(log_entry["avg_zone_temp"]))
+        self.series["outdoor_temp"].append(float(log_entry["outdoor_temp"]))
+        self.series["electric_kw"].append(float(log_entry["current_power"]) / 1000.0)
+        self.series["gas_kw"].append(float(log_entry["current_gas_power"]) / 1000.0)
+        self.series["reward"].append(float(log_entry["reward"]))
+        self.series["episode_reward"].append(float(log_entry["episode_reward"]))
+        self.series["heating_setpoint"].append(float(log_entry["heating_setpoint"]))
+        self.series["cooling_setpoint"].append(float(log_entry["cooling_setpoint"]))
+
+        co2_values = [
+            float(value)
+            for key, value in log_entry.items()
+            if key.startswith("co2_") and not np.isnan(value)
+        ]
+        if not co2_values:
+            raise RuntimeError("Live plot requested average zone CO2, but no zone CO2 values were logged")
+        self.series["avg_co2"].append(float(np.mean(co2_values)))
+
+        if self.step_count % self.update_every != 0:
+            return
+
+        x = self.series["step"]
+        for name, line in self.lines.items():
+            line.set_data(x, self.series[name])
+
+        for ax in self.axes.ravel():
+            ax.relim()
+            ax.autoscale_view()
+
+        self.fig.canvas.draw_idle()
+        self.plt.pause(0.001)
+
+    def finish(self, output_dir, hold=False):
+        path = Path(output_dir) / "rl_hvac_live_plot.png"
+        self.fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved live plot snapshot to {path}")
+        if hold:
+            print("Close the plot window to finish.")
+            self.plt.ioff()
+            self.plt.show()
+        else:
+            self.plt.pause(0.001)
+
+
 class HVACEnvironment:
     """Environment wrapper for EnergyPlus HVAC control with RL agent."""
     
@@ -112,12 +237,12 @@ class HVACEnvironment:
         self.current_state = None
         self.current_action = None
         self.prev_temp = None
-        self.prev_energy = 0.0
+        self.prev_energy = None
 
         # Cached power (W) from callback_after_predictor_after_hvac_managers
         # (electricity and gas demand rates reset before zone timestep callback fires)
-        self._cached_power_w = 0.0
-        self._cached_gas_power_w = 0.0
+        self._cached_power_w = None
+        self._cached_gas_power_w = None
 
         # Programmatic overrides — set these from outside before each timestep to inject custom data.
         # Applied via pre_timestep_callback (before zone heat-balance calcs) each step.
@@ -148,15 +273,36 @@ class HVACEnvironment:
         # Outdoor CO2 from CSV (optional): override at each timestep
         sim_cfg = self.hvac_config.config.get('simulation', {})
         csv_path = sim_cfg.get('outdoor_co2_csv_path')
-        fallback_ppm = sim_cfg.get('outdoor_co2_ppm', 400)
         if csv_path:
             try:
+                fallback_ppm = sim_cfg.get('outdoor_co2_fallback_ppm')
+                if fallback_ppm is None:
+                    raise ValueError(
+                        "simulation.outdoor_co2_fallback_ppm is required when "
+                        "simulation.outdoor_co2_csv_path is set"
+                    )
                 self.outdoor_co2_lookup = load_outdoor_co2_csv(csv_path, fallback_ppm=fallback_ppm)
             except Exception as e:
-                print(f"Warning: could not load outdoor CO2 CSV '{csv_path}': {e}. Using static {fallback_ppm} ppm.")
-                self.outdoor_co2_lookup = None
+                raise RuntimeError(f"Could not load outdoor CO2 CSV '{csv_path}': {e}") from e
         else:
+            if sim_cfg.get('outdoor_co2_ppm') is None:
+                raise ValueError(
+                    "simulation.outdoor_co2_ppm is required when "
+                    "simulation.outdoor_co2_csv_path is not set"
+                )
             self.outdoor_co2_lookup = None
+
+    def _required_variable_handle(self, variable_name, keys):
+        """Return a variable handle for one of the allowed keys, or raise."""
+        for key in keys:
+            handle = self.api.exchange.get_variable_handle(self.state, variable_name, key)
+            if handle > 0:
+                return handle
+        key_list = ", ".join(repr(k) for k in keys)
+        raise RuntimeError(
+            f"EnergyPlus handle invalid for '{variable_name}' with keys [{key_list}]. "
+            "Declare the variable as Output:Variable and check the key in eplusout.rdd."
+        )
         
     def start_episode(self, duration_timesteps):
         """Set duration for the current episode (timesteps). Used when episode_duration_hours is a range."""
@@ -170,22 +316,18 @@ class HVACEnvironment:
             return True
             
         exchange = self.api.exchange
+        if not exchange.api_data_fully_ready(self.state):
+            return False
         
         # Weather handles
-        self.handles['oat'] = exchange.get_variable_handle(
-            self.state, "Site Outdoor Air Drybulb Temperature", "Environment"
-        )
-        self.handles['humidity'] = exchange.get_variable_handle(
-            self.state, "Site Outdoor Air Relative Humidity", "Environment"
-        )
-        self.handles['cloud_cover'] = exchange.get_variable_handle(
-            self.state, "Site Sky Temperature", "Environment"  # Proxy for cloud cover
-        )
-        
+        # Weather values are read from the EnergyPlus weather API in
+        # get_current_state(). Site weather Output:Variable handles are not
+        # stable across EnergyPlus versions/keys.
+
         # Zone handles (key zones for control)
-        zone_names = ["Core_bottom", "Core_mid", "Core_top", 
+        zone_names = ["Core_bottom", "Core_mid", "Core_top",
                      "Perimeter_mid_ZN_1", "Perimeter_mid_ZN_3"]
-        
+
         self.handles['zones'] = {}
         for zone_name in zone_names:
             zone_handles = {}
@@ -199,22 +341,27 @@ class HVACEnvironment:
                 self.state, "Zone Temperature Control", "Heating Setpoint", zone_name
             )
             zone_handles['airflow'] = exchange.get_actuator_handle(
-                self.state, "Zone Infiltration", "Air Exchange Flow Rate", 
+                self.state, "Zone Infiltration", "Air Exchange Flow Rate",
                 f"{zone_name} Infiltration"
             )
             zone_handles['co2'] = exchange.get_variable_handle(
                 self.state, "Zone Air CO2 Concentration", zone_name
             )
-            # Thermal comfort (Fanger) – PPD and PMV; available when People have Thermal Comfort Model 1 Type = FANGER
+            # Thermal comfort (Fanger) – PPD and PMV; optional, logged as NaN if unavailable
             zone_handles['ppd'] = exchange.get_variable_handle(
                 self.state, "Zone Thermal Comfort Fanger Model PPD", zone_name
             )
             zone_handles['pmv'] = exchange.get_variable_handle(
                 self.state, "Zone Thermal Comfort Fanger Model PMV", zone_name
             )
-            
+
+            critical = [f"{zone_name}.{k}" for k, h in zone_handles.items()
+                        if k in ('temp', 'cooling_sp', 'heating_sp', 'co2') and h <= 0]
+            if critical:
+                raise RuntimeError(f"EnergyPlus handle(s) invalid for zone '{zone_name}': {critical}")
+
             self.handles['zones'][zone_name] = zone_handles
-        
+
         # Energy consumption: "Facility Total Electricity Demand Rate" [W], key "*"
         # This variable must be declared in IDF as Output:Variable (injected by create_custom_idf).
         # Note: EnergyPlus 23.2+ uses this name (not the old "Facility Total Electric Demand Power").
@@ -222,15 +369,12 @@ class HVACEnvironment:
             self.state, "Facility Total Electricity Demand Rate", "Whole Building"
         )
         if self.handles['total_power'] <= 0:
-            print("Warning: Facility Total Electricity Demand Rate handle invalid; energy_cost and demand will be 0.")
+            raise RuntimeError("EnergyPlus handle invalid: 'Facility Total Electricity Demand Rate' — check Output:Variable in IDF")
 
-        # Natural gas: "Facility Total Natural Gas Demand Rate" [W thermal], key "Whole Building"
-        # Injected as Output:Variable by create_custom_idf.
-        self.handles['gas_power'] = exchange.get_variable_handle(
-            self.state, "Facility Total Natural Gas Demand Rate", "Whole Building"
-        )
-        if self.handles['gas_power'] <= 0:
-            print("Warning: Facility Total Natural Gas Demand Rate handle invalid; gas_cost will be 0.")
+        # Natural gas is exposed by this 25.2 model as a facility meter [J per timestep].
+        self.handles['gas_meter'] = exchange.get_meter_handle(self.state, "NaturalGas:Facility")
+        if self.handles['gas_meter'] <= 0:
+            raise RuntimeError("EnergyPlus meter handle invalid: 'NaturalGas:Facility' — check Output:Meter in IDF")
 
         # Outdoor CO2 schedule actuator — set_actuator_value overrides the schedule each step
         self.handles['outdoor_co2'] = exchange.get_actuator_handle(
@@ -314,24 +458,24 @@ class HVACEnvironment:
         zone_temps = []
         
         # Get actual zone temperatures from EnergyPlus
-        if self.handles_initialized:
-            zone_names = list(self.handles['zones'].keys())[:zone_count]
-            for zone_name in zone_names:
-                temp = exchange.get_variable_value(self.state, self.handles['zones'][zone_name]['temp'])
-                zone_temps.append(temp)
-        else:
-            # Fallback to dummy values
-            zone_temps = [self.base_temp] * zone_count
-        
-        # Ensure we have exactly zone_count temperatures
-        while len(zone_temps) < zone_count:
-            zone_temps.append(22.0)  # Default temperature
+        zone_names = list(self.handles['zones'].keys())[:zone_count]
+        for zone_name in zone_names:
+            temp = exchange.get_variable_value(self.state, self.handles['zones'][zone_name]['temp'])
+            zone_temps.append(temp)
         zone_temps = zone_temps[:zone_count]
-        
-        # Current weather
-        oat = exchange.get_variable_value(self.state, self.handles['oat']) if self.handles['oat'] > 0 else 20.0
-        humidity = exchange.get_variable_value(self.state, self.handles['humidity']) if self.handles['humidity'] > 0 else 0.5
-        cloud_cover = exchange.get_variable_value(self.state, self.handles['cloud_cover']) if self.handles['cloud_cover'] > 0 else 0.0
+
+        # Current weather from EnergyPlus weather API (actual EPW/override values, no fallback)
+        current_hour_for_weather = exchange.hour(self.state)
+        current_ts_for_weather = exchange.zone_time_step_number(self.state)
+        oat = exchange.today_weather_outdoor_dry_bulb_at_time(
+            self.state, current_hour_for_weather, current_ts_for_weather
+        )
+        humidity = exchange.today_weather_outdoor_relative_humidity_at_time(
+            self.state, current_hour_for_weather, current_ts_for_weather
+        )
+        cloud_cover = exchange.today_weather_sky_temperature_at_time(
+            self.state, current_hour_for_weather, current_ts_for_weather
+        )
         
         current_weather = [oat, humidity, cloud_cover]
         
@@ -367,34 +511,40 @@ class HVACEnvironment:
             current_month / 12.0  # Month of year
         ]
         
-        # Previous action
-        prev_action = self.current_action if self.current_action is not None else [0.0, 1.0, 0.5]
+        # Previous action. The first timestep has no previous control action,
+        # so that initial vector must be specified in the config.
+        if self.current_action is not None:
+            prev_action = self.current_action
+        else:
+            prev_cfg = self.hvac_config.config['state_space']['previous_actions']
+            prev_action = prev_cfg.get('initial_value')
+            if prev_action is None:
+                raise RuntimeError(
+                    "state_space.previous_actions.initial_value is required "
+                    "for the first control timestep"
+                )
+            if len(prev_action) != prev_cfg['count']:
+                raise RuntimeError(
+                    "state_space.previous_actions.initial_value length must match "
+                    "state_space.previous_actions.count"
+                )
         
         # Outdoor CO2 (ppm): from CSV lookup or config constant
         if self.outdoor_co2_lookup:
             outdoor_co2 = self.outdoor_co2_lookup.get_ppm(current_month, current_day, current_hour)
         else:
-            outdoor_co2 = self.hvac_config.config.get('simulation', {}).get('outdoor_co2_ppm', 400.0)
+            outdoor_co2 = self.hvac_config.config.get('simulation', {}).get('outdoor_co2_ppm')
+            if outdoor_co2 is None:
+                raise RuntimeError("Missing required simulation.outdoor_co2_ppm")
         co2_outdoor = [float(outdoor_co2)]
         
         # Zone CO2 (ppm) for the same zones as zone_temps
         zone_co2_list = []
-        if self.handles_initialized:
-            zone_count = self.hvac_config.config['state_space']['zone_temps']['count']
-            zone_co2_count = self.hvac_config.config['state_space'].get('zone_co2_ppm', {}).get('count', zone_count)
-            for i, (zone_name, zhandles) in enumerate(self.handles['zones'].items()):
-                if i >= zone_co2_count:
-                    break
-                h = zhandles.get('co2', -1)
-                if h and h > 0:
-                    zone_co2_list.append(exchange.get_variable_value(self.state, h))
-                else:
-                    zone_co2_list.append(float(outdoor_co2))
-            while len(zone_co2_list) < zone_co2_count:
-                zone_co2_list.append(float(outdoor_co2))
-        else:
-            zone_co2_count = self.hvac_config.config['state_space'].get('zone_co2_ppm', {}).get('count', 5)
-            zone_co2_list = [float(outdoor_co2)] * zone_co2_count
+        zone_co2_count = self.hvac_config.config['state_space'].get('zone_co2_ppm', {}).get('count', zone_count)
+        for i, (zone_name, zhandles) in enumerate(self.handles['zones'].items()):
+            if i >= zone_co2_count:
+                break
+            zone_co2_list.append(exchange.get_variable_value(self.state, zhandles['co2']))
         
         # Ensure all are lists (not numpy arrays) before concatenation
         zone_temps = list(zone_temps)
@@ -405,9 +555,15 @@ class HVACEnvironment:
         
         # Combine all features (should match config state_size): temps, weather, forecast, time, prev_action, outdoor_co2, zone_co2
         all_features = zone_temps + current_weather + forecast_weather + time_features + prev_action + co2_outdoor + zone_co2_list
-        state = np.array(all_features[:self.state_size])  # Trim to exact state size
-        
-        return state.astype(np.float32)
+        state = np.array(all_features[:self.state_size], dtype=np.float32)
+
+        if self.hvac_config.is_normalization_enabled():
+            mins, maxs = self.hvac_config.get_state_normalization_bounds()
+            mins = mins[:self.state_size]
+            maxs = maxs[:self.state_size]
+            state = np.clip((state - mins) / (maxs - mins), 0.0, 1.0)
+
+        return state
     
     def apply_action(self, action):
         """Apply action from RL agent to EnergyPlus model."""
@@ -491,13 +647,19 @@ class HVACEnvironment:
         #  callback_after_predictor_after_hvac_managers captures it while it's still valid)
         dt_hours = 1.0 / self.timesteps_per_hour
         current_power = self._cached_power_w
+        if current_power is None:
+            raise RuntimeError(
+                "Electric demand was not cached before reward calculation. "
+                "Check callback_after_predictor_after_hvac_managers registration."
+            )
         energy_kwh = (current_power / 1000.0) * dt_hours
         energy_cost = energy_kwh * energy_price_used * ENERGY_WEIGHT
 
         GAS_WEIGHT = reward_config.get('gas_weight', 0.3)
         GAS_PRICE = reward_config.get('gas_price_per_kwh', 0.017)
-        current_gas_power = self._cached_gas_power_w
-        gas_kwh = (current_gas_power / 1000.0) * dt_hours  # W thermal -> kWh thermal
+        gas_j = self.api.exchange.get_meter_value(self.state, self.handles['gas_meter'])
+        gas_kwh = gas_j / 3_600_000.0
+        current_gas_power = (gas_kwh / dt_hours) * 1000.0
         gas_cost = gas_kwh * GAS_PRICE * GAS_WEIGHT
         
         comfort_penalty = self._compute_comfort_penalty(reward_config, zone_temps)
@@ -570,7 +732,7 @@ class HVACEnvironment:
         
         # Episode end: use variable duration if set, else config default
         steps_this_episode = self._episode_duration_timesteps if self._episode_duration_timesteps is not None else self.episode_timesteps
-        done = (self.timestep_count >= steps_this_episode - 1) and current_day > 0 and not self.api.exchange.warmup_flag(self.state)
+        done = (self.timestep_count >= steps_this_episode) and current_day > 0 and not self.api.exchange.warmup_flag(self.state)
         
         return self.current_state, reward, done, {}
     
@@ -587,10 +749,11 @@ class HVACEnvironment:
 class RLHVACController:
     """Controller that uses RL agent for HVAC control."""
     
-    def __init__(self, api, state, config_path=None, training_mode=False):
+    def __init__(self, api, state, config_path=None, training_mode=False, live_plotter=None):
         self.api = api
         self.state = state
         self.training_mode = training_mode
+        self.live_plotter = live_plotter
         
         # Initialize environment
         self.env = HVACEnvironment(api, state, config_path)
@@ -628,12 +791,25 @@ class RLHVACController:
         # Control logging
         self.log_data = []
         self._co2_400_warned = False  # one-time diagnostic for CO2 stuck at 400
+        self.fatal_error = None
+        self._fatal_error_reported = False
+
+    def _handle_callback_error(self, exc):
+        """Record callback failures so run_simulation can fail cleanly."""
+        self.fatal_error = exc
+        if not self._fatal_error_reported:
+            self._fatal_error_reported = True
+            print(f"\nFATAL RL callback error: {exc}\n")
+        self.max_episodes_reached = True
+        self.api.runtime.stop_simulation(self.state)
 
     def power_cache_callback(self, state):
-        """Cache electricity and gas demand rates before they reset after zone reporting.
+        """Cache electricity demand rate before it resets after zone reporting.
         Registered for callback_after_predictor_after_hvac_managers (fires during HVAC sub-iterations).
         """
         if self.api.exchange.warmup_flag(state):
+            return
+        if not self.api.exchange.api_data_fully_ready(state):
             return
         if not self.env.handles_initialized:
             return
@@ -641,10 +817,6 @@ class RLHVACController:
         if self.env.handles.get('total_power', -1) > 0:
             self.env._cached_power_w = exchange.get_variable_value(
                 self.state, self.env.handles['total_power']
-            )
-        if self.env.handles.get('gas_power', -1) > 0:
-            self.env._cached_gas_power_w = exchange.get_variable_value(
-                self.state, self.env.handles['gas_power']
             )
 
     def pre_timestep_callback(self, state):
@@ -658,6 +830,8 @@ class RLHVACController:
         """
         if self.api.exchange.warmup_flag(state):
             return
+        if not self.api.exchange.api_data_fully_ready(state):
+            return
         if not self.env.handles_initialized:
             return
         self.env.apply_outdoor_co2_for_current_timestep()
@@ -665,21 +839,31 @@ class RLHVACController:
 
     def timestep_callback(self, state):
         """Called at each EnergyPlus timestep."""
+        try:
+            self._timestep_callback_impl(state)
+        except Exception as exc:
+            self._handle_callback_error(exc)
+
+    def _timestep_callback_impl(self, state):
+        """Called at each EnergyPlus timestep, with errors surfaced by wrapper."""
         # Skip if in warmup
         if self.api.exchange.warmup_flag(state):
             return
-            
+
+        if not self.api.exchange.api_data_fully_ready(state):
+            return
+
         # Skip if max episodes reached
         if self.max_episodes_reached:
             return
-        
+
         # Training window: only run RL between start and end date/time
         current_month = self.api.exchange.month(self.state)
         current_day = self.api.exchange.day_of_month(self.state)
         current_hour = self.api.exchange.hour(self.state)
         if not _in_training_window(current_month, current_day, current_hour, self.training_window):
             return
-        
+
         # Initialize environment on first real timestep inside window
         if not self.env.handles_initialized:
             if not self.env.initialize_handles():
@@ -751,6 +935,18 @@ class RLHVACController:
         
         # Current episode number (1-based)
         episode_no = self.episode_count + 1
+
+        action_bounds = self.env.hvac_config.get_action_bounds()
+
+        def _scale(a, lo, hi):
+            return lo + (np.clip(a, -1.0, 1.0) + 1.0) / 2.0 * (hi - lo)
+
+        sp_offset = _scale(action[0], action_bounds['sp_offset'][0], action_bounds['sp_offset'][1])
+        deadband = _scale(action[1], action_bounds['deadband'][0], action_bounds['deadband'][1])
+        airflow_mult = _scale(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1])
+        airflow_actual = self.env.min_airflow + (self.env.max_airflow - self.env.min_airflow) * airflow_mult
+        htg_sp = self.env.base_temp + sp_offset - deadband / 2
+        clg_sp = self.env.base_temp + sp_offset + deadband / 2
         
         # Zone CO2 (ppm) and thermal comfort PPD/PMV; -1 or 0 handle means not available in this IDF
         zone_co2 = {}
@@ -801,6 +997,11 @@ class RLHVACController:
             'current_gas_power': current_gas_power,
             'avg_zone_temp': np.mean(current_state[:5]),
             'outdoor_temp': current_state[5],
+            'heating_setpoint': htg_sp,
+            'cooling_setpoint': clg_sp,
+            'setpoint_offset': sp_offset,
+            'deadband': deadband,
+            'airflow': airflow_actual,
             'episode_reward': self.env.episode_reward,
             'hour': current_hour,
             'day': current_day,
@@ -810,6 +1011,8 @@ class RLHVACController:
             **zone_pmv
         }
         self.log_data.append(log_entry)
+        if self.live_plotter is not None:
+            self.live_plotter.update(log_entry)
         
         # Print progress (use step-within-episode for display; variable-length episodes)
         timestep_minutes = 60 // self.env.timesteps_per_hour
@@ -830,26 +1033,32 @@ class RLHVACController:
     
         
         # Same [-1,1] -> bounds scaling as apply_action (for display)
-        action_bounds = self.env.hvac_config.get_action_bounds()
-        def _scale(a, lo, hi):
-            return lo + (np.clip(a, -1.0, 1.0) + 1.0) / 2.0 * (hi - lo)
-        sp_offset = _scale(action[0], action_bounds['sp_offset'][0], action_bounds['sp_offset'][1])
-        deadband = _scale(action[1], action_bounds['deadband'][0], action_bounds['deadband'][1])
-        airflow_mult = _scale(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1])
-        airflow_actual = self.env.min_airflow + (self.env.max_airflow - self.env.min_airflow) * airflow_mult
-        htg_sp = self.env.base_temp + sp_offset - deadband / 2
-        clg_sp = self.env.base_temp + sp_offset + deadband / 2
-        
         # States: zone temps (first 5), then outdoor temp
         zone_count = self.env.hvac_config.config['state_space']['zone_temps']['count']
         zone_temps = current_state[:zone_count]
-        outdoor_temp = current_state[zone_count] if len(current_state) > zone_count else 0.0
+        if len(current_state) <= zone_count:
+            raise RuntimeError(
+                f"State is missing outdoor temperature at index {zone_count}; "
+                f"state length is {len(current_state)}"
+            )
+        outdoor_temp = current_state[zone_count]
         zone_str = ", ".join([f"{t:5.1f}" for t in zone_temps])
         
         # Print: time, step; actual actions (raw + scaled); states; reward; then blank line
-        print(f"{datetime_str} | Step {episode_step:3d}")
-        print(f"   Actions: raw [{action[0]:+.2f}, {action[1]:+.2f}, {action[2]:+.2f}]  ->  sp_offset={sp_offset:+5.2f}°C  htg_sp={htg_sp:.1f}°C  clg_sp={clg_sp:.1f}°C  deadband={deadband:4.2f}°C  airflow={airflow_actual:.4f} m³/s")
+        print(f"{datetime_str} | Ep {episode_no:3d} | Step {episode_step:3d}")
+        action_items = [
+            f"raw_sp={action[0]:+.2f}", f"raw_db={action[1]:+.2f}", f"raw_af={action[2]:+.2f}",
+            f"sp_offset={sp_offset:+.2f}°C", f"htg_sp={htg_sp:.1f}°C",
+            f"clg_sp={clg_sp:.1f}°C", f"deadband={deadband:.2f}°C", f"airflow={airflow_actual:.4f}m³/s",
+        ]
+        print("   Actions:")
+        for i in range(0, len(action_items), 5):
+            print("     " + "  ".join(action_items[i:i+5]))
         print(f"   States:  zone_temps=[{zone_str}]°C  outdoor_temp={outdoor_temp:5.1f}°C")
+        print(f"   State vector [{len(current_state)}]:")
+        for i in range(0, len(current_state), 10):
+            chunk = current_state[i:i+10]
+            print("     " + "  ".join([f"[{i+j:2d}]{v:+.3f}" for j, v in enumerate(chunk)]))
         print(f"   Reward: {reward:7.3f}  episode_total={self.env.episode_reward:7.3f}  |  elec_cost[$]={energy_cost:.4f}  gas_cost[$]={gas_cost:.4f}  comfort={comfort_penalty:.4f}  setpoint={setpoint_penalty:.4f}  demand_penalty[$]={demand_penalty:.4f}  total_cost={total_cost:.4f}  |  price[$/kWh]={energy_price_used:.3f}  elec[kWh]={energy_kwh:.4f}  elec[kW]={current_power/1000:.2f}  gas[kWh]={gas_kwh:.4f}  gas[kW]={current_gas_power/1000:.2f}")
         print()
         
@@ -917,7 +1126,18 @@ RL HVAC Control Summary:
         print(f"Saved {len(self.log_data)} timesteps to {filepath}")
 
 
-def run_simulation(idf_path, epw_path, output_dir, config, max_episodes=None, training_mode=False, override_test=False):
+def run_simulation(
+    idf_path,
+    epw_path,
+    output_dir,
+    config,
+    max_episodes=None,
+    training_mode=False,
+    override_test=False,
+    live_plot=False,
+    live_plot_every=1,
+    live_plot_hold=False,
+):
     """Run EnergyPlus simulation with RL HVAC control.
     
     Simulation is driven by config training_window (start/end date and time) and
@@ -961,7 +1181,7 @@ def run_simulation(idf_path, epw_path, output_dir, config, max_episodes=None, tr
         sim_cfg = hvac_config.config.get('simulation', {})
         outdoor_co2 = sim_cfg.get('outdoor_co2_ppm')
         outdoor_co2_csv = sim_cfg.get('outdoor_co2_csv_path')
-        outdoor_co2_fallback = sim_cfg.get('outdoor_co2_fallback_ppm', 400)
+        outdoor_co2_fallback = sim_cfg.get('outdoor_co2_fallback_ppm')
         idf_path = create_custom_idf(
             idf_path, start_month, start_day, end_month, end_day, output_dir,
             outdoor_co2_ppm=outdoor_co2,
@@ -969,9 +1189,20 @@ def run_simulation(idf_path, epw_path, output_dir, config, max_episodes=None, tr
             outdoor_co2_fallback_ppm=outdoor_co2_fallback,
         )
     
+    live_plotter = None
+    if live_plot:
+        live_plotter = LiveRLPlotter(output_dir=output_dir, update_every=live_plot_every)
+        print(f"Live plot enabled (updates every {max(1, int(live_plot_every))} timestep(s))")
+
     api = EnergyPlusAPI()
     state = api.state_manager.new_state()
-    controller = RLHVACController(api, state, config, training_mode=training_mode)
+    controller = RLHVACController(
+        api,
+        state,
+        config,
+        training_mode=training_mode,
+        live_plotter=live_plotter,
+    )
     controller.max_episodes = max_episodes
 
     if override_test:
@@ -1004,24 +1235,77 @@ def run_simulation(idf_path, epw_path, output_dir, config, max_episodes=None, tr
         state, controller.timestep_callback
     )
     
-    # Print configuration summary
+    # Print configuration summary and named state vector columns
+    cfg = controller.env.hvac_config.config
+    ss = cfg['state_space']
+    zone_names = list(controller.env.handles['zones'].keys()) if controller.env.handles_initialized else \
+                 ["Core_bottom", "Core_mid", "Core_top", "Perimeter_mid_ZN_1", "Perimeter_mid_ZN_3"]
+    zone_count = ss['zone_temps']['count']
+    forecast_horizon = ss['weather_forecast']['horizon']
+    forecast_vars = ss['weather_forecast']['variables']
+    co2_count = ss.get('zone_co2_ppm', {}).get('count', zone_count)
+
+    state_columns = []
+    for z in zone_names[:zone_count]:
+        state_columns.append(f"zone_temp_{z}")
+    state_columns += ["oat", "humidity", "sky_temp"]
+    for t in range(1, forecast_horizon + 1):
+        state_columns += [f"forecast_t{t}_oat", f"forecast_t{t}_humidity", f"forecast_t{t}_sky_temp"]
+    state_columns += ["hour_of_day", "day_of_week", "month_of_year"]
+    state_columns += ["prev_sp_offset", "prev_deadband", "prev_airflow"]
+    state_columns += ["outdoor_co2"]
+    for z in zone_names[:co2_count]:
+        state_columns.append(f"zone_co2_{z}")
+
     print("\n" + "=" * 60)
     print("RL HVAC Control Configuration")
     print("=" * 60)
     print(f"  Timesteps per hour: {controller.env.timesteps_per_hour}")
-    print(f"  State size: {controller.env.state_size}")
-    print(f"  Action size: {controller.env.action_size}")
-    print(f"  Training mode: {controller.training_mode}")
-    print("=" * 60)  
+    print(f"  Training mode:      {controller.training_mode}")
+    print(f"  Action size:        {controller.env.action_size}  [sp_offset, deadband, airflow_multiplier]")
+    action_cfg = cfg['action_space']
+    action_columns = [
+        ("sp_offset",          action_cfg['sp_offset']['min'],          action_cfg['sp_offset']['max'],          "°C"),
+        ("deadband",           action_cfg['deadband']['min'],           action_cfg['deadband']['max'],           "°C"),
+        ("airflow_multiplier", action_cfg['airflow_multiplier']['min'], action_cfg['airflow_multiplier']['max'], "x"),
+    ]
+
+    print(f"  Action vector columns [{len(action_columns)}]:")
+    for i, (name, lo, hi, unit) in enumerate(action_columns):
+        print(f"    [{i}] {name:<22} range [{lo}, {hi}] {unit}  (agent output: tanh [-1, 1])")
+    norm_enabled = controller.env.hvac_config.is_normalization_enabled()
+    norm_label = "ON" if norm_enabled else "OFF"
+    print(f"  State size:         {controller.env.state_size}  (normalization: {norm_label})")
+    print(f"  State vector columns [{len(state_columns)}]:")
+    max_name_len = max(len(n) for n in state_columns)
+    for i in range(0, len(state_columns), 6):
+        chunk = state_columns[i:i+6]
+        print("    " + "  ".join([f"[{i+j:2d}] {name:<{max_name_len}}" for j, name in enumerate(chunk)]))
+    print("=" * 60)
+
+    try:
+        input("\nPress Enter to start simulation, or Ctrl+C to abort: ")
+    except KeyboardInterrupt:
+        print("\nSimulation aborted.")
+        return 1
+    except EOFError:
+        print("\nNo interactive stdin detected; starting simulation.")
+
     eplus_args = ['-w', epw_path, '-d', output_dir, idf_path]
     exit_code = api.runtime.run_energyplus(state, eplus_args)
+    if controller.fatal_error is not None:
+        print(f"RL controller failed: {controller.fatal_error}")
+        exit_code = 1
     
     # Clean up
-    if controller.training_mode:
+    if controller.training_mode and controller.fatal_error is None:
         model_path = os.path.join(output_dir, 'rl_hvac_model.pth')
         controller.save_model(model_path)
     
-    controller.save_log_to_csv(os.path.join(output_dir, 'rl_hvac_log.csv'))
+    if controller.fatal_error is None:
+        controller.save_log_to_csv(os.path.join(output_dir, 'rl_hvac_log.csv'))
+        if live_plotter is not None:
+            live_plotter.finish(output_dir, hold=live_plot_hold)
     
     api.state_manager.delete_state(state)
     
@@ -1063,6 +1347,12 @@ def main():
                         help='Number of episodes (default: from config duration_hours / episode_hours)')
     parser.add_argument('--override-test', action='store_true',
                         help='Inject fixed weather (dry_bulb=35°C, humidity=80%%) and CO2 (650 ppm) every step to verify override pipeline')
+    parser.add_argument('--live-plot', action='store_true',
+                        help='Show a live matplotlib plot while the RL simulation is running')
+    parser.add_argument('--live-plot-every', type=int, default=1,
+                        help='Refresh the live plot every N logged timesteps (default: 1)')
+    parser.add_argument('--live-plot-hold', action='store_true',
+                        help='Keep the live plot window open after the simulation finishes')
     
     args = parser.parse_args()
     
@@ -1095,6 +1385,9 @@ def main():
         max_episodes=args.episodes,
         training_mode=args.training,
         override_test=args.override_test,
+        live_plot=args.live_plot,
+        live_plot_every=args.live_plot_every,
+        live_plot_hold=args.live_plot_hold,
     )
 
 

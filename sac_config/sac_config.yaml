@@ -43,7 +43,7 @@ model:
 
 # Training configuration
 training:
-  # Device selection: 'auto', 'cuda', or 'cpu'
+  # Device selection: 'auto', 'mps', 'cuda', or 'cpu'
   device: auto
   
   # Number of training episodes

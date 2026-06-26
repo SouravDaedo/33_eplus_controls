@@ -1,3 +1,5 @@
 pyenergyplus-lbnl
 requests
 pandas
+PyYAML
+matplotlib

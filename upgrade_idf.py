@@ -156,6 +156,31 @@ def find_local_eplus_installations():
     return installations
 
 
+def stage_transition_tool_dir(source_dir, cache_dir):
+    """Stage local transition tools into a writable directory."""
+    staged_dir = os.path.join(cache_dir, 'local_transition_tools')
+    os.makedirs(staged_dir, exist_ok=True)
+
+    for name in os.listdir(source_dir):
+        source_path = os.path.join(source_dir, name)
+        staged_path = os.path.join(staged_dir, name)
+
+        # Transition executables need the IDD/rules/report files in the working
+        # directory, but the GUI app bundle is not needed for CLI upgrades.
+        if os.path.isdir(source_path):
+            continue
+
+        if os.path.exists(staged_path):
+            continue
+
+        try:
+            os.symlink(source_path, staged_path)
+        except OSError:
+            shutil.copy2(source_path, staged_path)
+
+    return staged_dir
+
+
 def find_transition_tool(from_ver, to_ver, local_paths, cache_dir):
     """Find transition tool locally or download it."""
     from_parts = from_ver.replace('.', '-')
@@ -170,7 +195,8 @@ def find_transition_tool(from_ver, to_ver, local_paths, cache_dir):
     for local_path in local_paths:
         exe_path = os.path.join(local_path, exe_name)
         if os.path.exists(exe_path):
-            return exe_path, local_path
+            staged_dir = stage_transition_tool_dir(local_path, cache_dir)
+            return os.path.join(staged_dir, exe_name), staged_dir
     
     # Check cache directory
     exe_path = os.path.join(cache_dir, exe_name)

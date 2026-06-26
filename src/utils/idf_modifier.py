@@ -8,6 +8,60 @@ import shutil
 from datetime import datetime, timedelta
 
 
+def _has_output_variable(lines, variable_name):
+    pattern = re.compile(
+        r'^\s*Output:Variable\s*,[^,;]*,\s*' + re.escape(variable_name) + r'\s*,',
+        re.IGNORECASE,
+    )
+    return any(pattern.search(line) for line in lines if not line.strip().startswith('!'))
+
+
+def _ensure_output_variable(lines, variable_name, key='*', frequency='Timestep', comment=None):
+    if _has_output_variable(lines, variable_name):
+        return
+    if comment:
+        lines.append('')
+        lines.append(comment)
+    lines.append(f'  Output:Variable,{key},{variable_name},{frequency};')
+
+
+def _has_output_meter(lines, meter_name):
+    pattern = re.compile(
+        r'^\s*Output:Meter\s*,\s*' + re.escape(meter_name) + r'\s*,',
+        re.IGNORECASE,
+    )
+    return any(pattern.search(line) for line in lines if not line.strip().startswith('!'))
+
+
+def _ensure_output_meter(lines, meter_name, frequency='Timestep', comment=None):
+    if _has_output_meter(lines, meter_name):
+        return
+    if comment:
+        lines.append('')
+        lines.append(comment)
+    lines.append(f'  Output:Meter,{meter_name},{frequency};')
+
+
+def _apply_current_energyplus_compatibility(lines):
+    """Apply small IDF compatibility fixes for the installed EnergyPlus schema."""
+    updated_lines = []
+    zone_averaged_count = 0
+
+    for line in lines:
+        if 'ZoneAveraged' in line and 'Mean Radiant Temperature Calculation Type' in line:
+            line = line.replace('ZoneAveraged', 'EnclosureAveraged')
+            zone_averaged_count += 1
+        updated_lines.append(line)
+
+    if zone_averaged_count:
+        print(
+            "EnergyPlus compatibility: replaced "
+            f"{zone_averaged_count} People MRT entries from ZoneAveraged to EnclosureAveraged"
+        )
+
+    return updated_lines
+
+
 def create_custom_idf(
     original_idf_path,
     start_month,
@@ -17,7 +71,7 @@ def create_custom_idf(
     output_dir=None,
     outdoor_co2_ppm=None,
     outdoor_co2_csv_path=None,
-    outdoor_co2_fallback_ppm=400,
+    outdoor_co2_fallback_ppm=None,
 ):
     """
     Create a modified IDF file with custom simulation period.
@@ -31,13 +85,14 @@ def create_custom_idf(
         output_dir: Directory to save modified IDF (defaults to same as original)
         outdoor_co2_ppm: If set (and outdoor_co2_csv_path not set), constant outdoor CO2 (ppm)
         outdoor_co2_csv_path: If set, use time-varying outdoor CO2 from CSV (Schedule:File)
-        outdoor_co2_fallback_ppm: Fallback ppm when building schedule from CSV (missing hours)
+        outdoor_co2_fallback_ppm: Required ppm value when building a schedule from CSV with missing hours
 
     Returns:
         Path to modified IDF file
     """
     if output_dir is None:
         output_dir = os.path.dirname(original_idf_path)
+    os.makedirs(output_dir, exist_ok=True)
 
     # Read original IDF
     with open(original_idf_path, 'r') as f:
@@ -54,20 +109,20 @@ def create_custom_idf(
     # Time-varying outdoor CO2: write 8760-hour schedule file and we'll replace Schedule:Constant with Schedule:File
     schedule_file_name = None
     if outdoor_co2_csv_path:
-        try:
-            from src.utils.outdoor_co2_schedule import write_ep_outdoor_co2_schedule
-            schedule_file_name = "outdoor_co2_schedule.csv"
-            out_schedule_path = os.path.join(output_dir, schedule_file_name)
-            write_ep_outdoor_co2_schedule(
-                outdoor_co2_csv_path,
-                out_schedule_path,
-                fallback_ppm=outdoor_co2_fallback_ppm,
-                year=2023,
+        if outdoor_co2_fallback_ppm is None:
+            raise ValueError(
+                "outdoor_co2_fallback_ppm is required when outdoor_co2_csv_path is set"
             )
-            print(f"Outdoor CO2: time-varying from {outdoor_co2_csv_path} -> {schedule_file_name}")
-        except Exception as e:
-            print(f"Warning: could not build outdoor CO2 schedule from CSV: {e}; using constant.")
-            schedule_file_name = None
+        from src.utils.outdoor_co2_schedule import write_ep_outdoor_co2_schedule
+        schedule_file_name = "outdoor_co2_schedule.csv"
+        out_schedule_path = os.path.join(output_dir, schedule_file_name)
+        write_ep_outdoor_co2_schedule(
+            outdoor_co2_csv_path,
+            out_schedule_path,
+            fallback_ppm=outdoor_co2_fallback_ppm,
+            year=2023,
+        )
+        print(f"Outdoor CO2: time-varying from {outdoor_co2_csv_path} -> {schedule_file_name}")
 
     # Find and replace RunPeriod section; optionally replace or override outdoor CO2 schedule
     lines = idf_content.split('\n')
@@ -146,6 +201,8 @@ def create_custom_idf(
     if not runperiod_found:
         raise ValueError("No RunPeriod found in IDF file")
 
+    new_lines = _apply_current_energyplus_compatibility(new_lines)
+
     # Check if SizingPeriod objects are preserved
     sizing_periods = [line for line in new_lines if 'SizingPeriod:' in line]
     print(f"Preserved {len(sizing_periods)} SizingPeriod objects")
@@ -157,18 +214,30 @@ def create_custom_idf(
         if all_sizing:
             print(f"First SizingPeriod line: {all_sizing[0].strip()}")
 
-    # Ensure facility electricity demand rate is requested (for RL reward energy cost)
-    # Note: EnergyPlus 23.2+ uses "Facility Total Electricity Demand Rate" (not "Electric Demand Power")
-    if not any('Facility Total Electricity Demand Rate' in line for line in new_lines):
-        new_lines.append('')
-        new_lines.append('! Injected for RL: facility total electricity demand rate (W)')
-        new_lines.append('  Output:Variable,*,Facility Total Electricity Demand Rate,Timestep;')
+    # Ensure required RL variables are declared. EnergyPlus Python API returns
+    # invalid handles for variables that are only referenced by EMS or reports.
+    _ensure_output_variable(
+        new_lines,
+        'Facility Total Electricity Demand Rate',
+        comment='! Injected for RL: facility total electricity demand rate (W)',
+    )
+    _ensure_output_meter(
+        new_lines,
+        'NaturalGas:Facility',
+        comment='! Injected for RL: facility natural gas meter (J per timestep)',
+    )
 
-    # Ensure facility natural gas demand rate is requested (for RL reward gas cost)
-    if not any('Facility Total Natural Gas Demand Rate' in line for line in new_lines):
-        new_lines.append('')
-        new_lines.append('! Injected for RL: facility total natural gas demand rate (W thermal)')
-        new_lines.append('  Output:Variable,*,Facility Total Natural Gas Demand Rate,Timestep;')
+    weather_variables = [
+        'Site Outdoor Air Drybulb Temperature',
+        'Site Outdoor Air Relative Humidity',
+        'Site Sky Temperature',
+    ]
+    for idx, variable_name in enumerate(weather_variables):
+        _ensure_output_variable(
+            new_lines,
+            variable_name,
+            comment='! Injected for RL state: site weather variables (required for Python API handle)' if idx == 0 else None,
+        )
 
     # Write modified IDF
     with open(modified_idf_path, 'w') as f:
