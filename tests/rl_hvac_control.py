@@ -88,8 +88,12 @@ def _sample_random_start_in_window(window, after_month=None, after_day=None, aft
 class LiveRLPlotter:
     """Small matplotlib dashboard updated from the EnergyPlus callback."""
 
-    def __init__(self, output_dir, update_every=1):
+    def __init__(self, output_dir, update_every=1, episode_scope="current"):
         self.update_every = max(1, int(update_every))
+        if episode_scope not in {"current", "all"}:
+            raise ValueError("episode_scope must be 'current' or 'all'")
+        self.episode_scope = episode_scope
+        self.current_episode = None
         self.step_count = 0
         mpl_cache_dir = Path(output_dir) / ".matplotlib-cache"
         mpl_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -116,23 +120,53 @@ class LiveRLPlotter:
             "reward": [],
             "episode_reward": [],
             "avg_co2": [],
+            "outdoor_co2": [],
             "heating_setpoint": [],
             "cooling_setpoint": [],
+            "airflow": [],
         }
 
         self.lines = {}
+        self.plot_axes = []
         self._setup_axes()
+
+    def _empty_series(self):
+        return {
+            "step": [],
+            "avg_zone_temp": [],
+            "outdoor_temp": [],
+            "electric_kw": [],
+            "gas_kw": [],
+            "reward": [],
+            "episode_reward": [],
+            "avg_co2": [],
+            "outdoor_co2": [],
+            "heating_setpoint": [],
+            "cooling_setpoint": [],
+            "airflow": [],
+        }
+
+    def _reset_for_episode(self, episode):
+        self.series = self._empty_series()
+        self.current_episode = episode
+        self.step_count = 0
+        for line in self.lines.values():
+            line.set_data([], [])
+        self.fig.suptitle(f"RL HVAC Simulation Live Plot - Episode {episode}")
+        for ax in self.plot_axes:
+            ax.relim()
+            ax.autoscale_view()
+        self.fig.canvas.draw_idle()
 
     def _setup_axes(self):
         ax_temp, ax_power, ax_reward, ax_co2 = self.axes.ravel()
 
-        self.lines["avg_zone_temp"], = ax_temp.plot([], [], label="Avg Zone Temp", color="tab:blue")
-        self.lines["outdoor_temp"], = ax_temp.plot([], [], label="Outdoor Temp", color="tab:orange")
+        self.lines["avg_zone_temp"], = ax_temp.plot([], [], label="Avg Zone Temp", color="tab:blue", linewidth=3.0)
         self.lines["heating_setpoint"], = ax_temp.plot(
-            [], [], label="Heating Setpoint", color="tab:red", linestyle="--"
+            [], [], label="Heating Setpoint", color="black", linestyle="--", drawstyle="steps-post", alpha=0.9
         )
         self.lines["cooling_setpoint"], = ax_temp.plot(
-            [], [], label="Cooling Setpoint", color="tab:green", linestyle="--"
+            [], [], label="Cooling Setpoint", color="black", linestyle="--", drawstyle="steps-post", alpha=0.9
         )
         ax_temp.set_ylabel("Temperature (C)")
         ax_temp.legend(loc="best")
@@ -141,8 +175,19 @@ class LiveRLPlotter:
         self.lines["electric_kw"], = ax_power.plot([], [], label="Electric", color="tab:red")
         self.lines["gas_kw"], = ax_power.plot([], [], label="Gas", color="tab:green")
         ax_power.set_ylabel("Power (kW)")
-        ax_power.legend(loc="best")
+        ax_airflow = ax_power.twinx()
+        self.lines["airflow"], = ax_airflow.plot(
+            [], [], label="Airflow", color="tab:blue", linestyle="--"
+        )
+        ax_airflow.set_ylabel("Airflow (m3/s)")
+        power_lines = [
+            self.lines["electric_kw"],
+            self.lines["gas_kw"],
+            self.lines["airflow"],
+        ]
+        ax_power.legend(power_lines, [line.get_label() for line in power_lines], loc="best")
         ax_power.grid(True, alpha=0.3)
+        self.plot_axes = [ax_temp, ax_power, ax_airflow, ax_reward, ax_co2]
 
         self.lines["reward"], = ax_reward.plot([], [], label="Step Reward", color="tab:purple")
         self.lines["episode_reward"], = ax_reward.plot([], [], label="Episode Reward", color="tab:brown")
@@ -152,19 +197,42 @@ class LiveRLPlotter:
         ax_reward.grid(True, alpha=0.3)
 
         self.lines["avg_co2"], = ax_co2.plot([], [], label="Avg Zone CO2", color="tab:cyan")
+        self.lines["outdoor_co2"], = ax_co2.plot(
+            [], [], label="Outdoor CO2", color="tab:green", linestyle="--"
+        )
         ax_co2.set_xlabel("Timestep")
         ax_co2.set_ylabel("CO2 (ppm)")
-        ax_co2.legend(loc="best")
+        ax_oat = ax_co2.twinx()
+        self.lines["outdoor_temp"], = ax_oat.plot([], [], label="Outdoor Temp", color="tab:orange")
+        ax_oat.set_ylabel("Outdoor Temp (C)")
+        co2_lines = [
+            self.lines["avg_co2"],
+            self.lines["outdoor_co2"],
+            self.lines["outdoor_temp"],
+        ]
+        ax_co2.legend(co2_lines, [line.get_label() for line in co2_lines], loc="best")
         ax_co2.grid(True, alpha=0.3)
+        self.plot_axes.append(ax_oat)
 
         self.fig.tight_layout()
         self.fig.canvas.draw_idle()
         self.plt.pause(0.001)
 
     def update(self, log_entry):
+        episode = int(log_entry["episode"])
+        if self.current_episode is None:
+            self.current_episode = episode
+            self.fig.suptitle(
+                "RL HVAC Simulation Live Plot"
+                if self.episode_scope == "all"
+                else f"RL HVAC Simulation Live Plot - Episode {episode}"
+            )
+        elif self.episode_scope == "current" and episode != self.current_episode:
+            self._reset_for_episode(episode)
+
         self.step_count += 1
 
-        step = len(self.series["step"]) + 1
+        step = int(log_entry["timestep"]) if self.episode_scope == "current" else len(self.series["step"]) + 1
         self.series["step"].append(step)
         self.series["avg_zone_temp"].append(float(log_entry["avg_zone_temp"]))
         self.series["outdoor_temp"].append(float(log_entry["outdoor_temp"]))
@@ -174,6 +242,8 @@ class LiveRLPlotter:
         self.series["episode_reward"].append(float(log_entry["episode_reward"]))
         self.series["heating_setpoint"].append(float(log_entry["heating_setpoint"]))
         self.series["cooling_setpoint"].append(float(log_entry["cooling_setpoint"]))
+        self.series["airflow"].append(float(log_entry["airflow"]))
+        self.series["outdoor_co2"].append(float(log_entry["outdoor_co2"]))
 
         co2_values = [
             float(value)
@@ -191,7 +261,7 @@ class LiveRLPlotter:
         for name, line in self.lines.items():
             line.set_data(x, self.series[name])
 
-        for ax in self.axes.ravel():
+        for ax in self.plot_axes:
             ax.relim()
             ax.autoscale_view()
 
@@ -405,7 +475,7 @@ class HVACEnvironment:
     def apply_outdoor_co2_for_current_timestep(self):
         """Set outdoor CO2 schedule actuator for this timestep.
 
-        Priority: outdoor_co2_override (programmatic) > CSV lookup > no-op.
+        Priority: outdoor_co2_override (programmatic) > CSV lookup > config value.
         Set env.outdoor_co2_override = <ppm> at any time to inject a custom value every step.
         """
         if not self.handles_initialized:
@@ -413,16 +483,22 @@ class HVACEnvironment:
         h = self.handles.get('outdoor_co2', -1)
         if h is None or h <= 0:
             return
-        if self.outdoor_co2_override is not None:
-            ppm = float(self.outdoor_co2_override)
-        elif self.outdoor_co2_lookup:
-            month = self.api.exchange.month(self.state)
-            day = self.api.exchange.day_of_month(self.state)
-            hour = self.api.exchange.hour(self.state)
-            ppm = self.outdoor_co2_lookup.get_ppm(month, day, hour)
-        else:
-            return
+        month = self.api.exchange.month(self.state)
+        day = self.api.exchange.day_of_month(self.state)
+        hour = self.api.exchange.hour(self.state)
+        ppm = self.get_outdoor_co2_ppm(month, day, hour)
         self.api.exchange.set_actuator_value(self.state, h, ppm)
+
+    def get_outdoor_co2_ppm(self, month, day, hour):
+        """Return the outdoor CO2 value used by the controller for this timestep."""
+        if self.outdoor_co2_override is not None:
+            return float(self.outdoor_co2_override)
+        if self.outdoor_co2_lookup:
+            return float(self.outdoor_co2_lookup.get_ppm(month, day, hour))
+        outdoor_co2 = self.hvac_config.config.get('simulation', {}).get('outdoor_co2_ppm')
+        if outdoor_co2 is None:
+            raise RuntimeError("Missing required simulation.outdoor_co2_ppm")
+        return float(outdoor_co2)
 
     def apply_weather_override(self):
         """Override EPW weather values for this timestep from env.weather_override dict.
@@ -529,13 +605,8 @@ class HVACEnvironment:
                     "state_space.previous_actions.count"
                 )
         
-        # Outdoor CO2 (ppm): from CSV lookup or config constant
-        if self.outdoor_co2_lookup:
-            outdoor_co2 = self.outdoor_co2_lookup.get_ppm(current_month, current_day, current_hour)
-        else:
-            outdoor_co2 = self.hvac_config.config.get('simulation', {}).get('outdoor_co2_ppm')
-            if outdoor_co2 is None:
-                raise RuntimeError("Missing required simulation.outdoor_co2_ppm")
+        # Outdoor CO2 (ppm): from override, CSV lookup, or explicit config constant
+        outdoor_co2 = self.get_outdoor_co2_ppm(current_month, current_day, current_hour)
         co2_outdoor = [float(outdoor_co2)]
         
         # Zone CO2 (ppm) for the same zones as zone_temps
@@ -947,6 +1018,7 @@ class RLHVACController:
         airflow_actual = self.env.min_airflow + (self.env.max_airflow - self.env.min_airflow) * airflow_mult
         htg_sp = self.env.base_temp + sp_offset - deadband / 2
         clg_sp = self.env.base_temp + sp_offset + deadband / 2
+        outdoor_co2 = self.env.get_outdoor_co2_ppm(current_month, current_day, current_hour)
         
         # Zone CO2 (ppm) and thermal comfort PPD/PMV; -1 or 0 handle means not available in this IDF
         zone_co2 = {}
@@ -997,6 +1069,7 @@ class RLHVACController:
             'current_gas_power': current_gas_power,
             'avg_zone_temp': np.mean(current_state[:5]),
             'outdoor_temp': current_state[5],
+            'outdoor_co2': outdoor_co2,
             'heating_setpoint': htg_sp,
             'cooling_setpoint': clg_sp,
             'setpoint_offset': sp_offset,
@@ -1137,6 +1210,7 @@ def run_simulation(
     live_plot=False,
     live_plot_every=1,
     live_plot_hold=False,
+    live_plot_scope="current",
 ):
     """Run EnergyPlus simulation with RL HVAC control.
     
@@ -1191,8 +1265,15 @@ def run_simulation(
     
     live_plotter = None
     if live_plot:
-        live_plotter = LiveRLPlotter(output_dir=output_dir, update_every=live_plot_every)
-        print(f"Live plot enabled (updates every {max(1, int(live_plot_every))} timestep(s))")
+        live_plotter = LiveRLPlotter(
+            output_dir=output_dir,
+            update_every=live_plot_every,
+            episode_scope=live_plot_scope,
+        )
+        print(
+            f"Live plot enabled (updates every {max(1, int(live_plot_every))} "
+            f"timestep(s), scope: {live_plot_scope})"
+        )
 
     api = EnergyPlusAPI()
     state = api.state_manager.new_state()
@@ -1353,6 +1434,8 @@ def main():
                         help='Refresh the live plot every N logged timesteps (default: 1)')
     parser.add_argument('--live-plot-hold', action='store_true',
                         help='Keep the live plot window open after the simulation finishes')
+    parser.add_argument('--live-plot-scope', choices=['current', 'all'], default='current',
+                        help='Live plot scope: current resets at each episode; all overlays all episodes on one continuous timeline')
     
     args = parser.parse_args()
     
@@ -1388,6 +1471,7 @@ def main():
         live_plot=args.live_plot,
         live_plot_every=args.live_plot_every,
         live_plot_hold=args.live_plot_hold,
+        live_plot_scope=args.live_plot_scope,
     )
 
 

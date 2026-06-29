@@ -183,7 +183,43 @@ python tests/rl_hvac_control.py \
   --live-plot-hold
 ```
 
-The live plot shows average zone temperature, outdoor temperature, effective heating/cooling setpoints, electricity/gas power, reward, cumulative episode reward, and average zone CO₂. A final snapshot is saved as `rl_hvac_live_plot.png` in the output directory.
+The live plot shows average zone temperature, effective heating/cooling setpoints, effective airflow action, electricity/gas power, reward, cumulative episode reward, average zone CO₂, outside-air CO₂, and outdoor air temperature. Outdoor air temperature is grouped with the CO₂ panel on a second y-axis. A final snapshot is saved as `rl_hvac_live_plot.png` in the output directory.
+
+Live plot options:
+
+| Flag | Use |
+|------|-----|
+| `--live-plot` | Opens the running matplotlib dashboard |
+| `--live-plot-hold` | Keeps the plot window open after the simulation finishes |
+| `--live-plot-every N` | Refreshes the plot every `N` logged timesteps; useful for long runs |
+| `--live-plot-scope current` | Default. Resets the plot when a new episode starts, so only the current episode is shown |
+| `--live-plot-scope all` | Keeps all episodes on one continuous x-axis |
+
+For multiple episodes with a separate plot per episode:
+
+```bash
+python tests/rl_hvac_control.py \
+  --config config/hvac_config_24h.yaml \
+  --epw weather/chicago/TMY_lat41.88_lon-87.63.epw \
+  --output outputs/rl_hvac_24h \
+  --episodes 3 \
+  --live-plot \
+  --live-plot-scope current \
+  --live-plot-hold
+```
+
+For multiple episodes on one continuous plot:
+
+```bash
+python tests/rl_hvac_control.py \
+  --config config/hvac_config_24h.yaml \
+  --epw weather/chicago/TMY_lat41.88_lon-87.63.epw \
+  --output outputs/rl_hvac_24h \
+  --episodes 3 \
+  --live-plot \
+  --live-plot-scope all \
+  --live-plot-hold
+```
 
 To choose the start day/hour and duration, edit these fields in `config/hvac_config_24h.yaml`:
 
@@ -254,6 +290,36 @@ SAC config (learning rate, batch size, replay buffer, etc.) lives in `sac_config
 |------|-------------|
 | `MediumOffice_IAQ.idf` | **Primary model** — DOE Medium Office with CO₂ tracking, Fanger comfort output, VAV system with gas reheat coils. Used by `rl_hvac_control.py`. |
 | `MediumOffice_Control.idf` | Medium office configured for external setpoint actuation |
+
+#### Building Model — `MediumOffice_IAQ.idf`
+
+**Zone layout (18 zones total):**
+
+| Floor | Zones | Notes |
+|-------|-------|-------|
+| Bottom | `Core_bottom`, `Perimeter_bot_ZN_1–4` | 5 occupied zones |
+| Mid | `Core_mid`, `Perimeter_mid_ZN_1–4` | 5 occupied zones |
+| Top | `Core_top`, `Perimeter_top_ZN_1–4` | 5 occupied zones |
+| Plenum | `TopFloor_Plenum` (+ 2 others) | Unconditioned return plenums — excluded from RL control |
+
+**HVAC system — 3 Packaged Rooftop Units (PACU_VAV):**
+
+One packaged unit per floor: `PACU_VAV_bot`, `PACU_VAV_mid`, `PACU_VAV_top`. Each unit is a self-contained packaged air conditioning unit (not a central chilled-water AHU) with the following air-side components in sequence:
+
+```
+OA Mixing Box → CoilSystem:Cooling:DX → Coil:Heating:Fuel (gas) → Fan:VariableVolume
+```
+
+Each PACU distributes conditioned air to VAV terminal boxes at its 5 zones. Supply air temperature is managed by `SetpointManager:Warmest` (range 12.8–15.6 °C), which automatically raises the SAT to the warmest value that still satisfies the zone with the highest cooling load. This setpoint can be overridden via the EnergyPlus API using the actuator on `PACU_VAV_<floor> Supply Equipment Outlet Node`.
+
+**Controllable actuators per zone (via EnergyPlus Python API):**
+
+| Actuator | Component type | Control type | Key |
+|----------|---------------|--------------|-----|
+| Heating setpoint | `Zone Temperature Control` | `Heating Setpoint` | `<zone_name>` |
+| Cooling setpoint | `Zone Temperature Control` | `Cooling Setpoint` | `<zone_name>` |
+| Infiltration airflow | `Zone Infiltration` | `Air Exchange Flow Rate` | `<zone_name> Infiltration` |
+| Supply air temp | `System Node Setpoint` | `Temperature Setpoint` | `PACU_VAV_<floor> Supply Equipment Outlet Node` |
 
 Gas heating note: the model uses `Coil:Heating:Fuel` (NaturalGas), so winter heating load appears in `gas[kW]`, not `elec[kW]`.
 
