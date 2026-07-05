@@ -91,6 +91,7 @@ eplus_controls/
 | `tests/plot_iaq_results.ipynb` | **Plot RL HVAC results** — CO₂, zone temps, reward components, PPD/PMV (uses `outputs/rl_hvac_control/rl_hvac_log.csv`) |
 | `plot_results.ipynb` | Plots external-controller simulation — temperatures, power, setpoints (uses `outputs/…/simulation_log.csv`) |
 | `download_weather.py` | Download EPW weather files from Open-Meteo or PVGIS |
+| `generate_outdoor_co2.py` | Generate time-varying outdoor CO₂ CSV (seasonal, rush hour, pollution events) for the RL simulation |
 | `integrated_simulation.py` | Combines building + solar PV + battery + pricing in a single simulation |
 | `battery_model.py` | Configurable battery energy storage model (charge/discharge state machine) |
 | `solar_pv_model.py` | PVWatts-based solar power model driven by EPW weather |
@@ -183,13 +184,28 @@ python tests/rl_hvac_control.py \
   --live-plot-hold
 ```
 
-The live plot shows average zone temperature, effective heating/cooling setpoints, effective airflow action, electricity/gas power, reward, cumulative episode reward, average zone CO₂, outside-air CO₂, and outdoor air temperature. Outdoor air temperature is grouped with the CO₂ panel on a second y-axis. A final snapshot is saved as `rl_hvac_live_plot.png` in the output directory.
+The HVAC live plot shows floor-average zone temperatures, effective heating/cooling setpoints, floor-average airflow, electricity/gas power, people/PPD, step reward, average zone CO₂, outside-air CO₂, and outdoor air temperature. Outdoor air temperature is grouped with the CO₂ panel on a second y-axis. A final snapshot is saved as `rl_hvac_live_plot.png` in the output directory.
+
+Add `--loss-plot` during training to open a separate SAC loss dashboard:
+
+```bash
+python tests/rl_hvac_control.py \
+  --config config/hvac_config_24h.yaml \
+  --epw weather/chicago/TMY_lat41.88_lon-87.63.epw \
+  --output outputs/rl_hvac_24h \
+  --episodes 3 \
+  --training \
+  --loss-plot
+```
+
+The loss plot tracks actor loss, critic 1 loss, critic 2 loss, and alpha loss. It is controlled separately from `--live-plot`; use both flags if you want both dashboards. A final snapshot is saved as `sac_training_losses.png` in the output directory.
 
 Live plot options:
 
 | Flag | Use |
 |------|-----|
 | `--live-plot` | Opens the running matplotlib dashboard |
+| `--loss-plot` | Opens a separate SAC loss dashboard; only active with `--training` |
 | `--live-plot-hold` | Keeps the plot window open after the simulation finishes |
 | `--live-plot-every N` | Refreshes the plot every `N` logged timesteps; useful for long runs |
 | `--live-plot-scope current` | Default. Resets the plot when a new episode starts, so only the current episode is shown |
@@ -244,6 +260,8 @@ This example runs one 24-hour episode from June 6 at 13:00 through June 7 at 13:
 |------|---------|
 | `rl_hvac_log.csv` | Per-timestep log: reward components, temperatures, power [kW], gas [kW], CO₂, actions |
 | `rl_hvac_model.pth` | Trained SAC model (only with `--training`) |
+| `rl_hvac_live_plot.png` | Final HVAC live plot snapshot (only with `--live-plot`) |
+| `sac_training_losses.png` | Final SAC loss plot snapshot (only with `--training --loss-plot`) |
 | `eplusout.err` | EnergyPlus warnings and errors |
 | `eplustbl.htm` | Annual energy summary table |
 
@@ -253,11 +271,128 @@ This example runs one 24-hour episode from June 6 at 13:00 through June 7 at 13:
 
 | Section | Key settings |
 |---------|-------------|
-| `simulation` | `idf_path`, `timesteps_per_hour`, `training_window` (date/time range for RL), `episode_duration_hours`, `outdoor_co2_ppm` |
+| `simulation` | `idf_path`, `timesteps_per_hour`, `training_window` (date/time range for RL), `episode_duration_hours`, `outdoor_co2_ppm`, `outdoor_co2_csv_path`, `outdoor_co2_fallback_ppm` |
 | `action_space` | `sp_offset` bounds, `deadband` bounds, `airflow_multiplier` bounds |
 | `reward` | `energy_weight`, `gas_weight`, `gas_price_per_kwh`, `comfort_weight`, `demand_weight`, `demand_threshold` [kW], `energy_price_per_kwh`, TOU pricing config |
 | `zones` | Zone names (15 zones) and group definitions (core, perimeter tiers) |
 | `weather_files` | Named EPW paths (default, summer, chicago, etc.) |
+
+---
+
+### Outdoor CO₂ schedule (`generate_outdoor_co2.py`)
+
+By default the simulation uses a **flat outdoor CO₂** value (`simulation.outdoor_co2_ppm: 400` in `hvac_config.yaml`). For realistic time-varying outdoor air, generate a CSV first, then point the config at it.
+
+**Workflow:**
+
+1. Generate the CSV (separate step — not auto-created at sim start).
+2. Set `outdoor_co2_csv_path` in `config/hvac_config.yaml`.
+3. Run `tests/rl_hvac_control.py` as usual.
+
+**What the model includes:**
+
+| Layer | Default | Notes |
+|-------|---------|-------|
+| Baseline | 420 ppm | `--baseline` |
+| Seasonal (Keeling curve) | ±8 ppm | `--seasonal-amplitude` |
+| Diurnal | ±3 ppm | Lowest ~14:00; `--diurnal-amplitude` |
+| Urban offset | 0 ppm | `--urban-increment` |
+| Weekday rush hour | +25–30 ppm peaks | Disable with `--no-rush-hour` |
+| One-time events | See below | Custom via `--event` / `--events-file` |
+| Noise | σ = 0.5 ppm | `--noise-std` |
+
+**Built-in one-time events** (included unless `--no-events` or `--no-default-events`):
+
+| Event | Start (month/day hour) | Duration | Peak +ppm | Scenario |
+|-------|------------------------|----------|-----------|----------|
+| `winter_inversion` | Jan 18, 00:00 | 48 h | +70 | Stagnant cold-air pool |
+| `industrial_release` | Mar 10, 14:00 | 8 h | +50 | Factory/plant upset |
+| `smog_inversion` | Apr 22, 00:00 | 36 h | +80 | Heat-inversion smog |
+| `smoke_alert` | May 8, 06:00 | 18 h | +35 | Regional air-quality alert |
+| `wildfire_smoke` | Jun 5, 06:00 | 72 h | +150 | Early-summer wildfire |
+| `holiday_fireworks` | Jul 4, 22:00 | 4 h | +20 | Evening combustion spike |
+| `pollution_spike` | Jul 14, 10:00 | 12 h | +60 | Industrial/traffic spike |
+| `wildfire_smoke_2` | Aug 18, 08:00 | 60 h | +120 | Late-summer wildfire |
+| `harvest_burn` | Oct 15, 07:00 | 12 h | +45 | Agricultural field burning |
+
+**Traffic jam events** — 20 additional localized backups (`traffic_jam_01` … `traffic_jam_20`), roughly 1–2 per month (morning ~08:00 or evening ~17:00, 4–7 h, +30–44 ppm). Examples: Jan 9 morning (+32), Jun 24 evening (+42), Sep 12 morning (+35), Dec 18 evening (+44). Full list is in `TRAFFIC_JAM_EVENTS` in `generate_outdoor_co2.py`.
+
+Each event is a single Gaussian pulse — it happens **once** on that calendar date in the generated year. Add your own with any label via `--event` or `--events-file`. An example JSON with seven custom events is in `data/co2_events_example.json`.
+
+**Year vs event dates:** Events are specified by **month, day, and hour only** (no year field). The calendar year comes from `--year` when generating the CSV. The output CSV also stores `month, day, hour, ppm` — the simulation looks up outdoor CO₂ by `(month, day, hour)` at runtime, so the pattern applies to whatever year EnergyPlus is simulating.
+
+**Generate a full year:**
+
+```bash
+python generate_outdoor_co2.py --year 2023
+# -> data/outdoor_co2_2023.csv
+```
+
+**Generate only your training window** (match `training_window` in `hvac_config.yaml`):
+
+```bash
+python generate_outdoor_co2.py --year 2023 \
+  --start-month 4 --start-day 12 \
+  --end-month 7 --end-day 30
+# -> data/outdoor_co2_2023_0412_to_0730.csv
+```
+
+All four range flags are required together; omit them for a full calendar year. Hours outside the CSV use `outdoor_co2_fallback_ppm` when the sim builds the 8760-hour EnergyPlus schedule.
+
+**Custom events** — repeat `--event` (month/day/hour only; year from `--year`):
+
+```bash
+python generate_outdoor_co2.py --year 2023 \
+  --start-month 4 --start-day 12 --end-month 7 --end-day 30 \
+  --no-default-events \
+  --event wildfire_1,6,5,6,72,150 \
+  --event wildfire_2,7,20,8,48,200
+```
+
+Format: `label,month,day,hour,duration_hours,peak_ppm`
+
+**Or load multiple events from JSON** (`--events-file`):
+
+```json
+[
+  {"label": "wildfire_1", "month": 6, "day": 5, "hour": 6, "duration_hours": 72, "peak_increment": 150},
+  {"label": "wildfire_2", "month": 7, "day": 20, "hour": 8, "duration_hours": 48, "peak_increment": 200}
+]
+```
+
+```bash
+python generate_outdoor_co2.py --year 2023 --events-file data/co2_events_example.json --no-default-events
+```
+
+Use `data/co2_events_example.json` as a starting template, or copy it to `data/my_co2_events.json` and edit.
+
+**Event flags:**
+
+| Flag | Effect |
+|------|--------|
+| *(none)* | All built-in one-time events (9 scenarios + 20 traffic jams) + weekday rush hour |
+| `--no-events` | No one-time events |
+| `--no-default-events` | Skip built-ins; use only `--event` / `--events-file` |
+| `--event ...` | Add custom event (repeatable) |
+| `--events-file path.json` | Load event list from JSON |
+
+To keep built-ins **and** add your own, pass `--event` without `--no-default-events`.
+
+**Wire into simulation** (`config/hvac_config.yaml`):
+
+```yaml
+simulation:
+  outdoor_co2_csv_path: "data/outdoor_co2_2023_0412_to_0730.csv"
+  outdoor_co2_fallback_ppm: 420
+```
+
+With `custom_period.enabled: true`, the custom IDF is patched to use a `Schedule:File` from this CSV. Each timestep, `HVACEnvironment` also sets outdoor CO₂ via the EnergyPlus actuator.
+
+**Flat override at runtime** (bypasses CSV):
+
+```python
+controller.env.outdoor_co2_override = 500.0  # ppm
+```
 
 ---
 

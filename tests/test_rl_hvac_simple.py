@@ -49,10 +49,9 @@ class MockHVACEnvironment:
         self.episode_reward = 0.0
         self.energy_consumption = []
         
-        # Weather simulation
-        self.weather_history = []
-        self.forecast_horizon = self.hvac_config.config['state_space']['weather_forecast']['horizon']
-        
+        # Weather simulation: per-variable forecast offsets (timesteps ahead)
+        self.weather_forecast_offsets = self.hvac_config.weather_forecast_offsets
+
         # Initialize state
         self.reset()
     
@@ -63,26 +62,32 @@ class MockHVACEnvironment:
         
         # Simulate zone temperatures
         zone_temps = np.random.normal(self.base_temp, 2.0, zone_count).tolist()
-        
-        # Simulate current weather
-        oat = 15.0 + 10 * np.sin(self.timestep_count * 0.01)  # Daily temperature cycle
-        humidity = 0.5 + 0.2 * np.sin(self.timestep_count * 0.005)
-        cloud_cover = 0.3 + 0.4 * np.random.random()
-        
-        current_weather = [oat, humidity, cloud_cover]
-        
-        # Update weather history
-        self.weather_history.append(current_weather)
-        if len(self.weather_history) > self.forecast_horizon:
-            self.weather_history.pop(0)
-        
-        # Forecasted weather (simple persistence forecast)
+
+        # Simulate weather as a deterministic function of timestep, so a real
+        # forward-looking forecast can be computed (not just replayed past values).
+        def weather_at(t, field):
+            if field == 'oat':
+                return 15.0 + 10 * np.sin(t * 0.01)  # Daily temperature cycle
+            if field == 'humidity':
+                return 0.5 + 0.2 * np.sin(t * 0.005)
+            return 0.3 + 0.4 * np.random.random()  # cloud_cover
+
+        current_weather = [weather_at(self.timestep_count, f) for f in ('oat', 'humidity', 'cloud_cover')]
+
+        # True forward-looking forecast: evaluate the same weather function ahead in
+        # time, using each variable's own list of offsets (grouped per variable).
+        # Gaussian noise (std growing linearly with lead time) is added when configured,
+        # so the agent trains against realistic forecast error, not perfect foresight.
+        noise_cfg = self.hvac_config.weather_forecast_noise
         forecast_weather = []
-        for i in range(self.forecast_horizon):
-            if i < len(self.weather_history):
-                forecast_weather.extend(self.weather_history[-(i+1)])
-            else:
-                forecast_weather.extend(current_weather)
+        for field in ('oat', 'humidity', 'cloud_cover'):
+            for offset in self.weather_forecast_offsets[field]:
+                value = weather_at(self.timestep_count + offset, field)
+                if noise_cfg['enabled'] and noise_cfg[field] > 0:
+                    value += np.random.normal(0.0, noise_cfg[field] * offset)
+                    if field == 'humidity':
+                        value = float(np.clip(value, 0.0, 1.0))
+                forecast_weather.append(value)
         
         # Time features
         hour = (self.timestep_count // self.timesteps_per_hour) % 24
@@ -180,7 +185,6 @@ class MockHVACEnvironment:
         self.current_action = None
         self.episode_reward = 0.0
         self.timestep_count = 0
-        self.weather_history = []
         return self.current_state
 
 

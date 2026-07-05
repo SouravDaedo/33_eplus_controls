@@ -397,8 +397,12 @@ class SACAgent:
         for target_param, param in zip(target.parameters(), source.parameters()):
             target_param.data.copy_(param.data)
     
-    def save(self, filepath: str):
-        """Save the trained model."""
+    def save(self, filepath: str, extra_state: dict = None):
+        """Save the trained model.
+
+        extra_state: optional caller-level metadata to round-trip through the checkpoint
+        (e.g. {'episode_count': N}), so a resumed run can continue numbering correctly.
+        """
         os.makedirs(os.path.dirname(filepath), exist_ok=True)
         torch.save({
             'actor_state_dict': self.actor.state_dict(),
@@ -415,39 +419,42 @@ class SACAgent:
             'actor_losses': self.actor_losses,
             'critic1_losses': self.critic1_losses,
             'critic2_losses': self.critic2_losses,
-            'alpha_losses': self.alpha_losses
+            'alpha_losses': self.alpha_losses,
+            'extra_state': extra_state or {},
         }, filepath)
         print(f"SAC model saved to {filepath}")
-    
+
     def load(self, filepath: str):
-        """Load a trained model."""
+        """Load a trained model. Returns the 'extra_state' dict passed to save() (or {})."""
         if os.path.exists(filepath):
             checkpoint = torch.load(filepath, map_location=self.device)
-            
+
             self.actor.load_state_dict(checkpoint['actor_state_dict'])
             self.critic1.load_state_dict(checkpoint['critic1_state_dict'])
             self.critic2.load_state_dict(checkpoint['critic2_state_dict'])
             self.target_critic1.load_state_dict(checkpoint['target_critic1_state_dict'])
             self.target_critic2.load_state_dict(checkpoint['target_critic2_state_dict'])
-            
+
             self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
             self.critic1_optimizer.load_state_dict(checkpoint['critic1_optimizer_state_dict'])
             self.critic2_optimizer.load_state_dict(checkpoint['critic2_optimizer_state_dict'])
-            
+
             if self.automatic_entropy_tuning and checkpoint['log_alpha'] is not None:
                 self.log_alpha = checkpoint['log_alpha']
                 self.alpha_optimizer.load_state_dict(checkpoint['alpha_optimizer_state_dict'])
                 self.alpha = self.log_alpha.exp()
-            
+
             self.training_step = checkpoint.get('training_step', 0)
             self.actor_losses = checkpoint.get('actor_losses', [])
             self.critic1_losses = checkpoint.get('critic1_losses', [])
             self.critic2_losses = checkpoint.get('critic2_losses', [])
             self.alpha_losses = checkpoint.get('alpha_losses', [])
-            
+
             print(f"SAC model loaded from {filepath}")
+            return checkpoint.get('extra_state', {}) or {}
         else:
             print(f"No SAC model found at {filepath}")
+            return {}
     
     def get_training_stats(self):
         """Get training statistics."""

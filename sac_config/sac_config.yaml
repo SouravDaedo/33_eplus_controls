@@ -53,7 +53,7 @@ training:
   max_steps_per_episode: 1000
   
   # Number of warmup steps before training starts
-  warmup_steps: 1000
+  warmup_steps: 288
   
   # How often to evaluate the agent (in episodes)
   eval_interval: 10

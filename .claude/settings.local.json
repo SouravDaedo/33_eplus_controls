@@ -3,7 +3,11 @@
     "allow": [
       "Bash(python -c \"from pyenergyplus.api import EnergyPlusAPI; print\\(''OK''\\)\")",
       "Bash(KMP_DUPLICATE_LIB_OK=TRUE /c/Users/didso/anaconda3/envs/bem/python.exe rl_hvac_control.py --config ../config/hvac_config.yaml --episodes 1)",
-      "Bash(echo \"Exit: $?\")"
+      "Bash(echo \"Exit: $?\")",
+      "Bash(python3 -c \"import sys; print\\(sys.executable\\)\")",
+      "Bash(/opt/miniconda3/bin/python3 -c \"import yaml; print\\('yaml ok'\\)\")",
+      "Bash(/opt/miniconda3/envs/ml_bem/bin/python3 -c ' *)",
+      "Bash(/opt/miniconda3/envs/ml_bem/bin/python3 tests/rl_hvac_control.py --help)"
     ]
   }
 }

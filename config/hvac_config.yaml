@@ -24,7 +24,7 @@ simulation:
   outdoor_co2_ppm: 400
   # Path to CSV of outdoor CO2 (ppm) per time step. If set, custom IDF uses Schedule:File for time-varying outdoor CO2.
   # CSV columns: month, day, hour, ppm  (hour 0-23)  OR  datetime, ppm
-  outdoor_co2_csv_path: null   # e.g. "data/outdoor_co2_2023.csv"
+  outdoor_co2_csv_path: data/outdoor_co2_2023_0412_to_0730.csv  # e.g. "data/outdoor_co2_2023.csv"
   # When using outdoor_co2_csv_path: fallback ppm for missing hours when building the 8760 schedule.
   outdoor_co2_fallback_ppm: 400
   
@@ -52,12 +52,33 @@ state_space:
     - name: "cloud_cover"
       description: "Cloud cover fraction (0-1)"
   
-  # Weather forecast (timesteps ahead)
+  # Weather forecast. Real forward-looking values read directly from the EPW file via
+  # EnergyPlus's today/tomorrow weather API (perfect foresight, not a lagged history
+  # buffer). Each variable specifies its own list of timesteps-ahead to forecast —
+  # they don't need to match (e.g. look further ahead on temperature than humidity).
   weather_forecast:
-    horizon: 6  # Number of timesteps to forecast
+    outdoor_air_temperature: [1, 3, 5]
+    relative_humidity: [1]
+    cloud_cover: [1, 3]
+    description: "Per-variable forecast offsets (zone timesteps ahead), EPW look-ahead"
+    # Forecast error: Gaussian noise added to each forecast value so the agent sees
+    # realistic forecast uncertainty instead of perfect foresight. Std grows linearly
+    # with lead time (offset timesteps ahead) — e.g. oat_std_per_step 0.3 means a
+    # forecast 5 timesteps out has std 1.5°C. Set enabled: false for perfect forecast.
+    noise:
+      enabled: true
+      oat_std_per_step: 0.3          # °C std per timestep of lead time
+      humidity_std_per_step: 1.0     # % std per timestep of lead time
+      cloud_cover_std_per_step: 1.0  # °C std per timestep of lead time (sky temp proxy)
+
+  # Optional past weather (lagged history). Disabled by default; enable to also give
+  # the agent short-term historical weather trend features alongside the forecast.
+  weather_history:
+    enabled: false
+    horizon: 6  # Number of past timesteps to include
     variables: 3  # temp, humidity, cloud_cover
-    description: "Weather forecast for next 6 timesteps"
-  
+    description: "Past observed weather for previous N timesteps (lag features)"
+
   # Time features
   time_features:
     - name: "hour_of_day"

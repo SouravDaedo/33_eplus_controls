@@ -32,17 +32,43 @@ class HVACConfig:
         # State space dimensions
         zone_count = self.config['state_space']['zone_temps']['count']
         current_weather_count = len(self.config['state_space']['current_weather'])
-        forecast_horizon = self.config['state_space']['weather_forecast']['horizon']
-        forecast_vars = self.config['state_space']['weather_forecast']['variables']
+
+        # Weather forecast: per-variable list of timesteps-ahead to forecast — each
+        # variable can look ahead by a different amount (or not be forecast at all).
+        wf_cfg = self.config['state_space']['weather_forecast']
+        self.weather_forecast_offsets = {
+            'oat': list(wf_cfg.get('outdoor_air_temperature', [])),
+            'humidity': list(wf_cfg.get('relative_humidity', [])),
+            'cloud_cover': list(wf_cfg.get('cloud_cover', [])),
+        }
+        forecast_count = sum(len(v) for v in self.weather_forecast_offsets.values())
+
+        # Forecast error: Gaussian noise std (per timestep of lead time) added to
+        # forecast values so the agent sees realistic uncertainty, not perfect foresight.
+        noise_cfg = wf_cfg.get('noise', {})
+        self.weather_forecast_noise = {
+            'enabled': bool(noise_cfg.get('enabled', False)),
+            'oat': float(noise_cfg.get('oat_std_per_step', 0.0)),
+            'humidity': float(noise_cfg.get('humidity_std_per_step', 0.0)),
+            'cloud_cover': float(noise_cfg.get('cloud_cover_std_per_step', 0.0)),
+        }
+
         time_features_count = len(self.config['state_space']['time_features'])
         prev_actions_count = self.config['state_space']['previous_actions']['count']
         outdoor_co2_count = self.config['state_space'].get('outdoor_co2_ppm', {}).get('count', 0)
         zone_co2_count = self.config['state_space'].get('zone_co2_ppm', {}).get('count', 0)
-        
-        self.state_size = (zone_count + 
-                         current_weather_count + 
-                         (forecast_horizon * forecast_vars) + 
-                         time_features_count + 
+
+        # Optional past weather (lagged history), disabled by default
+        weather_history_cfg = self.config['state_space'].get('weather_history', {})
+        self.weather_history_enabled = bool(weather_history_cfg.get('enabled', False))
+        self.weather_history_horizon = weather_history_cfg.get('horizon', 0) if self.weather_history_enabled else 0
+        weather_history_vars = weather_history_cfg.get('variables', current_weather_count)
+
+        self.state_size = (zone_count +
+                         current_weather_count +
+                         forecast_count +
+                         (self.weather_history_horizon * weather_history_vars) +
+                         time_features_count +
                          prev_actions_count +
                          outdoor_co2_count +
                          zone_co2_count)
@@ -151,21 +177,33 @@ class HVACConfig:
 
         ss = self.config['state_space']
         zone_count  = ss['zone_temps']['count']
-        horizon     = ss['weather_forecast']['horizon']
-        fvars       = ss['weather_forecast']['variables']
         n_time      = len(ss['time_features'])
         n_prev      = ss['previous_actions']['count']
         n_out_co2   = ss.get('outdoor_co2_ppm', {}).get('count', 0)
         n_zone_co2  = ss.get('zone_co2_ppm',    {}).get('count', 0)
+        past_horizon = self.weather_history_horizon
+        wf = self.weather_forecast_offsets
+
+        def _weather_block(n_steps):
+            # One (oat, humidity, sky_temp) triple per step, interleaved — matches the
+            # per-timestep [oat, humidity, sky_temp] order get_current_state() builds.
+            block = []
+            for _ in range(n_steps):
+                block += _b('oat', -20.0, 50.0, 1)
+                block += _b('humidity', 0.0, 100.0, 1)
+                block += _b('sky_temp', -30.0, 40.0, 1)
+            return block
 
         pairs = (
             _b('zone_temp',     10.0,  40.0,  zone_count) +
-            _b('oat',          -20.0,  50.0,  1) +
-            _b('humidity',       0.0, 100.0,  1) +
-            _b('sky_temp',     -30.0,  40.0,  1) +
-            _b('oat',          -20.0,  50.0,  horizon) +    # forecast oat
-            _b('humidity',       0.0, 100.0,  horizon) +    # forecast humidity
-            _b('sky_temp',     -30.0,  40.0,  horizon) +    # forecast sky_temp
+            _weather_block(1) +           # current weather
+            # Forecast weather: grouped per variable (oat offsets, then humidity
+            # offsets, then cloud_cover offsets) — matches get_current_state() order,
+            # since each variable can have a different number of forecast offsets.
+            _b('oat',          -20.0,  50.0,  len(wf['oat'])) +
+            _b('humidity',       0.0, 100.0,  len(wf['humidity'])) +
+            _b('sky_temp',     -30.0,  40.0,  len(wf['cloud_cover'])) +
+            _weather_block(past_horizon) + # past weather (lagged, interleaved per step)
             _b('hour_of_day',    0.0,   1.0,  1) +
             _b('day_of_week',    0.0,   1.0,  1) +
             _b('month_of_year',  0.0,   1.0,  1) +
@@ -191,7 +229,16 @@ class HVACConfig:
         print(f"  State size: {self.state_size}")
         print(f"  Zone temperatures: {self.config['state_space']['zone_temps']['count']}")
         print(f"  Current weather: {len(self.config['state_space']['current_weather'])}")
-        print(f"  Weather forecast: {self.config['state_space']['weather_forecast']['horizon']} × {self.config['state_space']['weather_forecast']['variables']}")
+        wf = self.weather_forecast_offsets
+        print(f"  Weather forecast offsets: oat={wf['oat']}, humidity={wf['humidity']}, cloud_cover={wf['cloud_cover']}")
+        wn = self.weather_forecast_noise
+        if wn['enabled']:
+            print(f"  Forecast noise (std/step): oat={wn['oat']}, humidity={wn['humidity']}, cloud_cover={wn['cloud_cover']}")
+        else:
+            print(f"  Forecast noise: disabled (perfect forecast)")
+        if self.weather_history_enabled:
+            wh = self.config['state_space']['weather_history']
+            print(f"  Weather history (past): {wh['horizon']} × {wh.get('variables', 3)}")
         print(f"  Time features: {len(self.config['state_space']['time_features'])}")
         print(f"  Previous actions: {self.config['state_space']['previous_actions']['count']}")
         print(f"\nAction Space:")
