@@ -7,7 +7,13 @@
       "Bash(python3 -c \"import sys; print\\(sys.executable\\)\")",
       "Bash(/opt/miniconda3/bin/python3 -c \"import yaml; print\\('yaml ok'\\)\")",
       "Bash(/opt/miniconda3/envs/ml_bem/bin/python3 -c ' *)",
-      "Bash(/opt/miniconda3/envs/ml_bem/bin/python3 tests/rl_hvac_control.py --help)"
+      "Bash(/opt/miniconda3/envs/ml_bem/bin/python3 tests/rl_hvac_control.py --help)",
+      "Bash(/opt/miniconda3/envs/ml_bem/bin/python3 -m py_compile tests/rl_hvac_control.py)",
+      "Bash(/opt/miniconda3/envs/ml_bem/bin/python3 -c \"import matplotlib; print\\(matplotlib.__version__\\)\")",
+      "Bash(grep -n -B1 -A30 \"^  Schedule:Compact,$\" energyplus/control_models/MediumOffice_IAQ.idf)",
+      "Bash(python3 -c ' *)",
+      "Bash(cat .claude/settings.local.json 2>/dev/null; echo \"---\"; cat .claude/settings.json 2>/dev/null; echo \"---global---\"; cat ~/.claude/settings.json 2>/dev/null)",
+      "Read(//Users/daedo/.claude/**)"
     ]
   }
 }

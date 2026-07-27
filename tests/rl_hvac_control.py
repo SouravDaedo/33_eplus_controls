@@ -3,7 +3,7 @@ RL-based HVAC Control with Setpoint and Airflow Management
 
 This script uses an existing RL agent (SAC) to control:
 - Heating and cooling setpoints with deadband
-- Airflow rates
+- AHU outdoor-air controller mass flow rates
 
 State includes:
 - Current zone temperature
@@ -19,6 +19,7 @@ import sys
 import numpy as np
 import pandas as pd
 import argparse
+from datetime import datetime, timedelta
 from pathlib import Path
 
 # Add project root to path
@@ -49,6 +50,15 @@ CONTROLLED_ZONE_NAMES = [
     "Perimeter_top_ZN_1", "Perimeter_top_ZN_2", "Perimeter_top_ZN_3", "Perimeter_top_ZN_4",
 ]
 
+FLOOR_ORDER = ["bottom", "mid", "top"]
+
+# Threshold above which RTP energy price is shaded as "high" on the temperature panels.
+HIGH_PRICE_THRESHOLD = 0.12
+# ASHRAE-typical design PPD (%) shown as a horizontal guide on the People/PPD panel.
+PPD_THRESHOLD = 10.0
+PPD_LINE_COLOR = "tab:olive"
+PPD_FILL_COLOR = "#c5d86d"  # lighter olive under the PPD curve
+
 FLOOR_ZONE_GROUPS = {
     "bottom": [
         "Core_bottom",
@@ -62,6 +72,53 @@ FLOOR_ZONE_GROUPS = {
         "Core_top",
         "Perimeter_top_ZN_1", "Perimeter_top_ZN_2", "Perimeter_top_ZN_3", "Perimeter_top_ZN_4",
     ],
+}
+
+# Core zones (one per floor) and perimeter zones grouped by floor for zone_temps.mode=perimeter_core
+CORE_ZONE_BY_FLOOR = {
+    "bottom": "Core_bottom",
+    "mid": "Core_mid",
+    "top": "Core_top",
+}
+
+PERIMETER_ZONE_GROUPS = {
+    "bottom": [
+        "Perimeter_bot_ZN_1", "Perimeter_bot_ZN_2", "Perimeter_bot_ZN_3", "Perimeter_bot_ZN_4",
+    ],
+    "mid": [
+        "Perimeter_mid_ZN_1", "Perimeter_mid_ZN_2", "Perimeter_mid_ZN_3", "Perimeter_mid_ZN_4",
+    ],
+    "top": [
+        "Perimeter_top_ZN_1", "Perimeter_top_ZN_2", "Perimeter_top_ZN_3", "Perimeter_top_ZN_4",
+    ],
+}
+
+# State vector column names when zone_temps.mode is "perimeter_core"
+# Order: core_bottom, core_mid, core_top, perimeter_bottom, perimeter_mid, perimeter_top
+PERIMETER_CORE_TEMP_COLUMNS = [
+    "core_bottom", "core_mid", "core_top",
+    "perimeter_bottom", "perimeter_mid", "perimeter_top",
+]
+
+# State vector column names when zone_temps.mode is "floor"
+FLOOR_TEMP_COLUMNS = ["bottom", "mid", "top"]
+
+AHU_OA_CONTROLS = {
+    # Direct Controller:OutdoorAir actuator from eplusout.edd:
+    # Component Type = "Outdoor Air Controller", Control Type = "Air Mass Flow Rate".
+    # The same RL action is applied to all three floor PACUs.
+    "bottom": {
+        "airloop": "PACU_VAV_bot",
+        "controller": "PACU_VAV_BOT_OA_CONTROLLER",
+    },
+    "mid": {
+        "airloop": "PACU_VAV_mid",
+        "controller": "PACU_VAV_MID_OA_CONTROLLER",
+    },
+    "top": {
+        "airloop": "PACU_VAV_top",
+        "controller": "PACU_VAV_TOP_OA_CONTROLLER",
+    },
 }
 
 
@@ -118,18 +175,28 @@ class LiveRLPlotter:
         self.episode_scope = episode_scope
         self.current_episode = None
         self.step_count = 0
+        # x-axis is elapsed hours since episode start (see update()); these track the
+        # real clock hour the episode began at (for tick labels) and the last seen
+        # calendar day (to draw a marker line whenever a new day starts).
+        self._episode_start_hour = None
+        self._last_month_day = None
+        self.day_markers = []
         mpl_cache_dir = Path(output_dir) / ".matplotlib-cache"
         mpl_cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache_dir))
 
         try:
             import matplotlib.pyplot as plt
+            from matplotlib.ticker import FuncFormatter
+            from matplotlib.patches import Patch
         except ImportError as exc:
             raise RuntimeError(
                 "Live plotting requires matplotlib. Install it in the active environment."
             ) from exc
 
         self.plt = plt
+        self.FuncFormatter = FuncFormatter
+        self.Patch = Patch
         plt.ion()
         self.fig, self.axes = plt.subplots(3, 3, figsize=(16, 10), num="RL HVAC Live Plot")
         self.fig.suptitle("RL HVAC Simulation Live Plot")
@@ -143,8 +210,12 @@ class LiveRLPlotter:
             "outdoor_temp": [],
             "electric_kw": [],
             "gas_kw": [],
+            "energy_price": [],
             "reward": [],
             "avg_co2": [],
+            "bottom_floor_co2": [],
+            "mid_floor_co2": [],
+            "top_floor_co2": [],
             "outdoor_co2": [],
             "heating_setpoint": [],
             "cooling_setpoint": [],
@@ -158,6 +229,10 @@ class LiveRLPlotter:
             "bottom_floor_airflow": [],
             "mid_floor_airflow": [],
             "top_floor_airflow": [],
+            "commanded_oa_mass_flow": [],
+            "bottom_floor_airflow_commanded": [],
+            "mid_floor_airflow_commanded": [],
+            "top_floor_airflow_commanded": [],
             "people": [],
             "avg_ppd": [],
             "energy_cost": [],
@@ -165,12 +240,14 @@ class LiveRLPlotter:
             "comfort_penalty": [],
             "setpoint_penalty": [],
             "demand_penalty": [],
+            "co2_penalty": [],
             "total_cost": [],
         }
 
         self.lines = {}
         self.fills = {}
         self.plot_axes = []
+        self.temp_axes = []
         self._setup_axes()
 
     def _empty_series(self):
@@ -183,8 +260,12 @@ class LiveRLPlotter:
             "outdoor_temp": [],
             "electric_kw": [],
             "gas_kw": [],
+            "energy_price": [],
             "reward": [],
             "avg_co2": [],
+            "bottom_floor_co2": [],
+            "mid_floor_co2": [],
+            "top_floor_co2": [],
             "outdoor_co2": [],
             "heating_setpoint": [],
             "cooling_setpoint": [],
@@ -198,6 +279,10 @@ class LiveRLPlotter:
             "bottom_floor_airflow": [],
             "mid_floor_airflow": [],
             "top_floor_airflow": [],
+            "commanded_oa_mass_flow": [],
+            "bottom_floor_airflow_commanded": [],
+            "mid_floor_airflow_commanded": [],
+            "top_floor_airflow_commanded": [],
             "people": [],
             "avg_ppd": [],
             "energy_cost": [],
@@ -205,6 +290,7 @@ class LiveRLPlotter:
             "comfort_penalty": [],
             "setpoint_penalty": [],
             "demand_penalty": [],
+            "co2_penalty": [],
             "total_cost": [],
         }
 
@@ -212,6 +298,11 @@ class LiveRLPlotter:
         self.series = self._empty_series()
         self.current_episode = episode
         self.step_count = 0
+        self._episode_start_hour = None
+        self._last_month_day = None
+        for marker in self.day_markers:
+            marker.remove()
+        self.day_markers = []
         for line in self.lines.values():
             line.set_data([], [])
         for fill in self.fills.values():
@@ -221,7 +312,31 @@ class LiveRLPlotter:
         for ax in self.plot_axes:
             ax.relim()
             ax.autoscale_view()
+        self.ax_co2.set_ylim(350, 900)
+
         self.fig.canvas.draw_idle()
+
+    def _hour_of_day_formatter(self, x, pos=None):
+        """Format an elapsed-hours x-value as the actual clock hour of day (HH:MM)."""
+        if self.episode_scope != "current" or self._episode_start_hour is None:
+            return f"{x:.0f}"
+        clock_hour = (self._episode_start_hour + x) % 24
+        hh = int(clock_hour)
+        mm = int(round((clock_hour - hh) * 60)) % 60
+        return f"{hh:02d}:{mm:02d}"
+
+    def _add_day_marker(self, x, month, day):
+        for ax in self.plot_axes:
+            self.day_markers.append(
+                ax.axvline(x, color="gray", linestyle=":", alpha=0.6, linewidth=1)
+            )
+        self.day_markers.append(
+            self.plot_axes[0].text(
+                x, 1.0, f"{month}/{day:02d}",
+                transform=self.plot_axes[0].get_xaxis_transform(),
+                va="bottom", ha="center", fontsize=7, color="gray",
+            )
+        )
 
     def _setup_floor_temp_axis(self, ax, series_name, label, color):
         self.lines[series_name], = ax.plot([], [], label=label, color=color, linewidth=3.0)
@@ -235,9 +350,14 @@ class LiveRLPlotter:
         )
         self._set_panel_title(ax, label)
         self._add_inside_ylabel(ax, "Temperature (C)")
-        ax.legend(loc="lower right", fontsize=8)
+        price_patch = self.Patch(
+            color="orange", alpha=0.08, label=f"High RTP (>${HIGH_PRICE_THRESHOLD:.2f}/kWh)"
+        )
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(handles + [price_patch], labels + [price_patch.get_label()], loc="lower right", fontsize=8)
         ax.grid(True, alpha=0.3)
         self._style_axis(ax)
+        self.temp_axes.append(ax)
 
     def _set_panel_title(self, ax, label):
         ax.set_title(label, fontsize=9, fontweight="bold", pad=4)
@@ -268,11 +388,18 @@ class LiveRLPlotter:
         ax.yaxis.label.set_size(9)
 
     def _setup_airflow_axis(self, ax, series_name, label, show_title=False, show_xticks=False):
-        self.lines[series_name], = ax.plot([], [], label=label, color="tab:blue", linewidth=1.8)
+        self.lines[series_name], = ax.plot(
+            [], [], label=f"{label} actual", color="tab:blue", linewidth=1.8
+        )
+        cmd_key = f"{series_name}_commanded"
+        self.lines[cmd_key], = ax.plot(
+            [], [], label="Commanded OA", color="tab:orange", linestyle="--",
+            linewidth=1.5, alpha=0.9, drawstyle="steps-post",
+        )
         if show_title:
-            self._set_panel_title(ax, "Avg Airflow")
-        self._add_inside_ylabel(ax, "Airflow (m3/s)")
-        ax.legend(loc="lower right", fontsize=7)
+            self._set_panel_title(ax, "AHU Outdoor Air (actual + commanded)")
+        self._add_inside_ylabel(ax, "OA Flow (kg/s)")
+        ax.legend(loc="lower right", fontsize=6)
         ax.grid(True, alpha=0.3)
         if not show_xticks:
             ax.tick_params(axis="x", labelbottom=False)
@@ -297,42 +424,74 @@ class LiveRLPlotter:
         self._setup_airflow_axis(ax_bottom_airflow, "bottom_floor_airflow", "Bottom Floor", show_title=True)
         self._setup_airflow_axis(ax_mid_airflow, "mid_floor_airflow", "Mid Floor")
         self._setup_airflow_axis(ax_top_airflow, "top_floor_airflow", "Top Floor", show_xticks=True)
-        ax_top_airflow.set_xlabel("Timestep")
+        ax_top_airflow.set_xlabel("Hour of Day")
         self.plot_axes = [
             ax_bottom_temp, ax_mid_temp, ax_top_temp,
             ax_bottom_airflow, ax_mid_airflow, ax_top_airflow,
             ax_people, ax_co2, ax_electric, ax_kpi_cost, ax_reward,
         ]
 
-        self.lines["people"], = ax_people.plot([], [], label="People", color="tab:olive", linewidth=2.0)
+        self.lines["people"], = ax_people.plot(
+            [], [], label="People", color="black", linewidth=1.2
+        )
         self._set_panel_title(ax_people, "People and PPD")
         self._add_inside_ylabel(ax_people, "People")
         ax_ppd = ax_people.twinx()
-        self.lines["avg_ppd"], = ax_ppd.plot([], [], label="Avg PPD", color="darkgoldenrod", linewidth=2.0)
+        self.ax_ppd = ax_ppd
+        self.lines["avg_ppd"], = ax_ppd.plot(
+            [], [], label="Avg PPD", color=PPD_LINE_COLOR, linewidth=1.8
+        )
+        self.ppd_threshold_line = ax_ppd.axhline(
+            PPD_THRESHOLD,
+            color="maroon",
+            linestyle="--",
+            linewidth=1.6,
+            alpha=0.9,
+            label=f"PPD threshold ({PPD_THRESHOLD:.0f}%)",
+        )
         self._add_inside_ylabel(ax_ppd, "PPD (%)", side="right")
-        people_lines = [self.lines["people"], self.lines["avg_ppd"]]
-        ax_people.legend(people_lines, [line.get_label() for line in people_lines], loc="lower right", fontsize=8)
+        people_lines = [
+            self.lines["people"],
+            self.lines["avg_ppd"],
+            self.ppd_threshold_line,
+        ]
+        ax_people.legend(
+            people_lines, [line.get_label() for line in people_lines],
+            loc="lower right", fontsize=8,
+        )
         ax_people.grid(True, alpha=0.3)
         self._style_axis(ax_people)
         self._style_axis(ax_ppd)
         self.plot_axes.append(ax_ppd)
 
-        self.lines["avg_co2"], = ax_co2.plot([], [], label="Avg Zone CO2", color="tab:cyan")
+        self.lines["bottom_floor_co2"], = ax_co2.plot(
+            [], [], label="Bottom Floor Avg", color="tab:cyan", linewidth=2.0
+        )
+        self.lines["mid_floor_co2"], = ax_co2.plot(
+            [], [], label="Mid Floor Avg", color="teal", linewidth=2.0
+        )
+        self.lines["top_floor_co2"], = ax_co2.plot(
+            [], [], label="Top Floor Avg", color="darkcyan", linewidth=2.0
+        )
         self.lines["outdoor_co2"], = ax_co2.plot(
             [], [], label="Outdoor CO2", color="tab:green", linestyle="--"
         )
-        ax_co2.set_xlabel("Timestep")
-        self._set_panel_title(ax_co2, "CO2 and Outdoor Temp")
+        ax_co2.set_xlabel("Hour of Day")
+        self._set_panel_title(ax_co2, "Floor Avg CO2 and Outdoor Temp")
         self._add_inside_ylabel(ax_co2, "CO2 (ppm)")
+        ax_co2.set_ylim(350, 900)
+        self.ax_co2 = ax_co2
         ax_oat = ax_co2.twinx()
         self.lines["outdoor_temp"], = ax_oat.plot([], [], label="Outdoor Temp", color="tab:orange")
         self._add_inside_ylabel(ax_oat, "Outdoor Temp (C)", side="right")
         co2_lines = [
-            self.lines["avg_co2"],
+            self.lines["bottom_floor_co2"],
+            self.lines["mid_floor_co2"],
+            self.lines["top_floor_co2"],
             self.lines["outdoor_co2"],
             self.lines["outdoor_temp"],
         ]
-        ax_co2.legend(co2_lines, [line.get_label() for line in co2_lines], loc="lower right", fontsize=8)
+        ax_co2.legend(co2_lines, [line.get_label() for line in co2_lines], loc="lower right", fontsize=7)
         ax_co2.grid(True, alpha=0.3)
         self._style_axis(ax_co2)
         self._style_axis(ax_oat)
@@ -340,19 +499,32 @@ class LiveRLPlotter:
 
         self.lines["electric_kw"], = ax_electric.plot([], [], label="Electric", color="tab:red", alpha=0.85)
         self.lines["gas_kw"], = ax_electric.plot([], [], label="Gas", color="tab:green", alpha=0.85)
-        ax_electric.set_xlabel("Timestep")
+        ax_electric.set_xlabel("Hour of Day")
         self._set_panel_title(ax_electric, "Electric and Gas Power")
         self._add_inside_ylabel(ax_electric, "Power (kW)")
-        ax_electric.legend(loc="lower right", fontsize=8)
         ax_electric.grid(True, alpha=0.3)
         self._style_axis(ax_electric)
+        ax_price = ax_electric.twinx()
+        self.lines["energy_price"], = ax_price.plot(
+            [], [], label="RTP Price", color="tab:purple", linestyle="--", linewidth=1.8, alpha=0.9
+        )
+        self._add_inside_ylabel(ax_price, "RTP ($/kWh)", side="right")
+        power_lines = [
+            self.lines["electric_kw"],
+            self.lines["gas_kw"],
+            self.lines["energy_price"],
+        ]
+        ax_electric.legend(power_lines, [line.get_label() for line in power_lines], loc="lower right", fontsize=8)
+        self._style_axis(ax_price)
+        self.plot_axes.append(ax_price)
 
         kpi_specs = [
             ("energy_cost", "Electric", "tab:red"),
             ("gas_cost", "Gas", "tab:green"),
-            ("comfort_penalty", "Comfort", "darkgoldenrod"),
+            ("comfort_penalty", "Thermal $", "darkgoldenrod"),
             ("setpoint_penalty", "Setpoint", "steelblue"),
             ("demand_penalty", "Demand", "tab:orange"),
+            ("co2_penalty", "IAQ $", "tab:cyan"),
             ("total_cost", "Total", "black"),
         ]
         for name, label, color in kpi_specs:
@@ -361,7 +533,7 @@ class LiveRLPlotter:
             self.lines[name], = ax_kpi_cost.plot(
                 [], [], label=label, color=color, linewidth=linewidth, alpha=alpha
             )
-        ax_kpi_cost.set_xlabel("Timestep")
+        ax_kpi_cost.set_xlabel("Hour of Day")
         self._set_panel_title(ax_kpi_cost, "Reward KPI Costs")
         self._add_inside_ylabel(ax_kpi_cost, "Cost / Penalty")
         ax_kpi_cost.legend(loc="lower right", fontsize=7, ncol=2)
@@ -369,12 +541,21 @@ class LiveRLPlotter:
         self._style_axis(ax_kpi_cost)
 
         self.lines["reward"], = ax_reward.plot([], [], label="Step Reward", color="tab:purple")
-        ax_reward.set_xlabel("Timestep")
+        ax_reward.set_xlabel("Hour of Day")
         self._set_panel_title(ax_reward, "Step Reward")
         self._add_inside_ylabel(ax_reward, "Step Reward")
         ax_reward.legend(loc="lower right", fontsize=8)
         ax_reward.grid(True, alpha=0.3)
         self._style_axis(ax_reward)
+
+        # x-axis ticks show actual clock hour-of-day (see _hour_of_day_formatter), not
+        # raw elapsed hours from 0; only meaningful for episode_scope="current".
+        formatter = self.FuncFormatter(self._hour_of_day_formatter)
+        for ax in set(self.plot_axes):
+            ax.xaxis.set_major_formatter(formatter)
+            for label in ax.get_xticklabels():
+                label.set_rotation(45)
+                label.set_ha("right")
 
         self.fig.tight_layout(pad=0.6, w_pad=0.35, h_pad=0.45)
         self.fig.subplots_adjust(wspace=0.18, hspace=0.28)
@@ -395,8 +576,19 @@ class LiveRLPlotter:
 
         self.step_count += 1
 
-        step = int(log_entry["timestep"]) if self.episode_scope == "current" else len(self.series["step"]) + 1
+        # x-axis is elapsed hours since episode start (monotonic; never wraps at
+        # midnight), so multi-day episodes plot as one continuous line. Tick labels
+        # are converted back to actual clock hour-of-day by _hour_of_day_formatter.
+        step = float(log_entry["elapsed_hours"]) if self.episode_scope == "current" else len(self.series["step"]) + 1
         self.series["step"].append(step)
+
+        if self.episode_scope == "current":
+            if self._episode_start_hour is None:
+                self._episode_start_hour = int(log_entry["hour"])
+            month_day = (int(log_entry["month"]), int(log_entry["day"]))
+            if self._last_month_day is not None and month_day != self._last_month_day:
+                self._add_day_marker(step, month_day[0], month_day[1])
+            self._last_month_day = month_day
         self.series["avg_zone_temp"].append(float(log_entry["avg_zone_temp"]))
         self.series["bottom_floor_temp"].append(self._avg_log_values(
             log_entry,
@@ -413,6 +605,7 @@ class LiveRLPlotter:
         self.series["outdoor_temp"].append(float(log_entry["outdoor_temp"]))
         self.series["electric_kw"].append(float(log_entry["current_power"]) / 1000.0)
         self.series["gas_kw"].append(float(log_entry["current_gas_power"]) / 1000.0)
+        self.series["energy_price"].append(float(log_entry["energy_price_used"]))
         self.series["reward"].append(float(log_entry["reward"]))
         self.series["heating_setpoint"].append(float(log_entry["heating_setpoint"]))
         self.series["cooling_setpoint"].append(float(log_entry["cooling_setpoint"]))
@@ -423,6 +616,12 @@ class LiveRLPlotter:
         self.series["bottom_floor_airflow"].append(float(log_entry.get("bottom_floor_airflow", log_entry["airflow"])))
         self.series["mid_floor_airflow"].append(float(log_entry.get("mid_floor_airflow", log_entry["airflow"])))
         self.series["top_floor_airflow"].append(float(log_entry.get("top_floor_airflow", log_entry["airflow"])))
+        cmd_oa = float(log_entry.get("commanded_oa_mass_flow", np.nan))
+        self.series["commanded_oa_mass_flow"].append(cmd_oa)
+        # Per-floor commanded overlays (same building-wide command)
+        self.series["bottom_floor_airflow_commanded"].append(cmd_oa)
+        self.series["mid_floor_airflow_commanded"].append(cmd_oa)
+        self.series["top_floor_airflow_commanded"].append(cmd_oa)
         self.series["outdoor_co2"].append(float(log_entry["outdoor_co2"]))
         self.series["people"].append(float(log_entry.get("people", np.nan)))
         self.series["energy_cost"].append(float(log_entry["energy_cost"]))
@@ -430,6 +629,7 @@ class LiveRLPlotter:
         self.series["comfort_penalty"].append(float(log_entry["comfort_penalty"]))
         self.series["setpoint_penalty"].append(float(log_entry["setpoint_penalty"]))
         self.series["demand_penalty"].append(float(log_entry["demand_penalty"]))
+        self.series["co2_penalty"].append(float(log_entry.get("co2_penalty", 0.0)))
         self.series["total_cost"].append(float(log_entry["total_cost"]))
 
         co2_values = [
@@ -438,8 +638,20 @@ class LiveRLPlotter:
             if key.startswith("co2_") and not np.isnan(value)
         ]
         if not co2_values:
-            raise RuntimeError("Live plot requested average zone CO2, but no zone CO2 values were logged")
+            raise RuntimeError("Live plot requested floor CO2, but no zone CO2 values were logged")
         self.series["avg_co2"].append(float(np.mean(co2_values)))
+        self.series["bottom_floor_co2"].append(self._avg_log_values(
+            log_entry,
+            [f"co2_{zone}" for zone in FLOOR_ZONE_GROUPS["bottom"]]
+        ))
+        self.series["mid_floor_co2"].append(self._avg_log_values(
+            log_entry,
+            [f"co2_{zone}" for zone in FLOOR_ZONE_GROUPS["mid"]]
+        ))
+        self.series["top_floor_co2"].append(self._avg_log_values(
+            log_entry,
+            [f"co2_{zone}" for zone in FLOOR_ZONE_GROUPS["top"]]
+        ))
 
         ppd_values = [
             float(value)
@@ -472,10 +684,25 @@ class LiveRLPlotter:
         self.fills["demand_penalty"] = self.axes[2, 1].fill_between(
             x, self.series["demand_penalty"], color="tab:orange", alpha=0.08
         )
+        self.fills["avg_ppd"] = self.ax_ppd.fill_between(
+            x, self.series["avg_ppd"], color=PPD_FILL_COLOR, alpha=0.35
+        )
+
+        # Shade x-regions where RTP price is "high" on the floor temperature panels.
+        # y-span (0, 1) is in axes-fraction via get_xaxis_transform(), so this tracks
+        # the x-axis only and does not perturb the temperature y-autoscale.
+        high_price = np.asarray(self.series["energy_price"]) > HIGH_PRICE_THRESHOLD
+        for ax in self.temp_axes:
+            fill_key = f"high_price_{id(ax)}"
+            self.fills[fill_key] = ax.fill_between(
+                x, 0, 1, where=high_price, transform=ax.get_xaxis_transform(),
+                color="orange", alpha=0.08, step="post",
+            )
 
         for ax in self.plot_axes:
             ax.relim()
             ax.autoscale_view()
+        self.ax_co2.set_ylim(350, 900)
 
         self.fig.canvas.draw_idle()
         self.plt.pause(0.001)
@@ -501,11 +728,21 @@ class LiveRLPlotter:
 
 
 class LiveLossPlotter:
-    """Small matplotlib dashboard for SAC training losses."""
+    """Live matplotlib dashboard for SAC losses and optional adaptive reward weights.
 
-    def __init__(self, output_dir, update_every=1):
+    When ``show_adaptive_weights`` is True, PPD/CO₂ scales and cost EMAs are drawn
+    in the same window as the SAC losses (third row).
+    """
+
+    def __init__(self, output_dir, update_every=1, show_losses=True, show_adaptive_weights=False):
+        if not show_losses and not show_adaptive_weights:
+            raise ValueError("LiveLossPlotter needs show_losses and/or show_adaptive_weights")
         self.update_every = max(1, int(update_every))
+        self.show_losses = bool(show_losses)
+        self.show_adaptive_weights = bool(show_adaptive_weights)
         self.step_count = 0
+        self.weight_step_count = 0
+        self._warmup_line = None
         mpl_cache_dir = Path(output_dir) / ".matplotlib-cache"
         mpl_cache_dir.mkdir(parents=True, exist_ok=True)
         os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache_dir))
@@ -519,37 +756,104 @@ class LiveLossPlotter:
 
         self.plt = plt
         plt.ion()
-        self.fig, self.axes = plt.subplots(2, 2, figsize=(10, 7), num="SAC Training Losses")
-        self.fig.suptitle("SAC Training Losses")
+        self.lines = {}
+        self.loss_axes = []
+        self.ax_scale = None
+        self.ax_ema = None
         self.series = {
             "update": [],
             "actor_loss": [],
             "critic1_loss": [],
             "critic2_loss": [],
             "alpha_loss": [],
+            "n_samples": [],
+            "comfort_scale": [],
+            "co2_scale": [],
+            "ema_energy": [],
+            "ema_comfort": [],
+            "ema_co2": [],
         }
-        self.lines = {}
-        self._setup_axes()
+        self._setup_figure()
 
-    def _setup_axis(self, ax, series_name, label, color):
+    def _setup_loss_axis(self, ax, series_name, label, color):
         self.lines[series_name], = ax.plot([], [], label=label, color=color, linewidth=1.8)
         ax.set_title(label, fontsize=9, fontweight="bold", pad=4)
         ax.set_xlabel("Training Update", fontsize=8)
         ax.tick_params(axis="both", labelsize=8)
         ax.legend(loc="best", fontsize=8)
         ax.grid(True, alpha=0.3)
+        self.loss_axes.append(ax)
 
-    def _setup_axes(self):
-        ax_actor, ax_critic1, ax_critic2, ax_alpha = self.axes.ravel()
-        self._setup_axis(ax_actor, "actor_loss", "Actor Loss", "tab:purple")
-        self._setup_axis(ax_critic1, "critic1_loss", "Critic 1 Loss", "tab:red")
-        self._setup_axis(ax_critic2, "critic2_loss", "Critic 2 Loss", "tab:orange")
-        self._setup_axis(ax_alpha, "alpha_loss", "Alpha Loss", "tab:blue")
-        self.fig.tight_layout(pad=0.8, w_pad=0.5, h_pad=0.7)
+    def _setup_figure(self):
+        title_bits = []
+        if self.show_losses:
+            title_bits.append("SAC Losses")
+        if self.show_adaptive_weights:
+            title_bits.append("Adaptive Weights")
+        title = " / ".join(title_bits)
+
+        if self.show_losses and self.show_adaptive_weights:
+            self.fig = self.plt.figure(figsize=(12, 10), num="SAC Losses + Adaptive Weights")
+            gs = self.fig.add_gridspec(3, 2, height_ratios=[1.0, 1.0, 1.15], hspace=0.35, wspace=0.25)
+            self._setup_loss_axis(self.fig.add_subplot(gs[0, 0]), "actor_loss", "Actor Loss", "tab:purple")
+            self._setup_loss_axis(self.fig.add_subplot(gs[0, 1]), "critic1_loss", "Critic 1 Loss", "tab:red")
+            self._setup_loss_axis(self.fig.add_subplot(gs[1, 0]), "critic2_loss", "Critic 2 Loss", "tab:orange")
+            self._setup_loss_axis(self.fig.add_subplot(gs[1, 1]), "alpha_loss", "Alpha Loss", "tab:blue")
+            self.ax_scale = self.fig.add_subplot(gs[2, 0])
+            self.ax_ema = self.fig.add_subplot(gs[2, 1])
+            self._setup_weight_axes()
+        elif self.show_losses:
+            self.fig, axes = self.plt.subplots(2, 2, figsize=(10, 7), num="SAC Training Losses")
+            ax_actor, ax_critic1, ax_critic2, ax_alpha = axes.ravel()
+            self._setup_loss_axis(ax_actor, "actor_loss", "Actor Loss", "tab:purple")
+            self._setup_loss_axis(ax_critic1, "critic1_loss", "Critic 1 Loss", "tab:red")
+            self._setup_loss_axis(ax_critic2, "critic2_loss", "Critic 2 Loss", "tab:orange")
+            self._setup_loss_axis(ax_alpha, "alpha_loss", "Alpha Loss", "tab:blue")
+            self.fig.tight_layout(pad=0.8, w_pad=0.5, h_pad=0.7)
+        else:
+            self.fig, (self.ax_scale, self.ax_ema) = self.plt.subplots(
+                1, 2, figsize=(12, 4.5), num="Adaptive Reward Weights"
+            )
+            self._setup_weight_axes()
+            self.fig.tight_layout(pad=0.9, w_pad=0.5)
+
+        self.fig.suptitle(title, fontsize=12, fontweight="bold", y=0.98)
         self.fig.canvas.draw_idle()
         self.plt.pause(0.001)
 
+    def _setup_weight_axes(self):
+        self.lines["comfort_scale"], = self.ax_scale.plot(
+            [], [], label="PPD scale", color="darkgoldenrod", linewidth=2.0
+        )
+        self.lines["co2_scale"], = self.ax_scale.plot(
+            [], [], label="CO₂ scale", color="tab:cyan", linewidth=2.0
+        )
+        self.ax_scale.set_ylabel("Adaptive scale")
+        self.ax_scale.set_xlabel("Adaptive samples")
+        self.ax_scale.set_ylim(-0.05, 1.05)
+        self.ax_scale.legend(loc="best", fontsize=8)
+        self.ax_scale.grid(True, alpha=0.3)
+        self.ax_scale.set_title("PPD / CO₂ scales (converge after warmup)", fontsize=9, fontweight="bold")
+
+        self.lines["ema_energy"], = self.ax_ema.plot(
+            [], [], label="EMA(energy $)", color="tab:red", linewidth=1.8
+        )
+        self.lines["ema_comfort"], = self.ax_ema.plot(
+            [], [], label="EMA(PPD raw $)", color="darkgoldenrod", linewidth=1.8, alpha=0.9
+        )
+        self.lines["ema_co2"], = self.ax_ema.plot(
+            [], [], label="EMA(CO₂ raw $)", color="tab:cyan", linewidth=1.8, alpha=0.9
+        )
+        self.ax_ema.set_xlabel("Adaptive samples")
+        self.ax_ema.set_ylabel("EMA cost ($)")
+        self.ax_ema.legend(loc="best", fontsize=8)
+        self.ax_ema.grid(True, alpha=0.3)
+        self.ax_ema.set_title("Cost EMAs used for rebalancing", fontsize=9, fontweight="bold")
+
     def update(self, update_no, losses):
+        """Append SAC training losses (called on each agent update)."""
+        if not self.show_losses:
+            return
         self.step_count += 1
         self.series["update"].append(int(update_no))
         self.series["actor_loss"].append(float(losses["actor_loss"]))
@@ -562,18 +866,63 @@ class LiveLossPlotter:
             return
 
         x = self.series["update"]
-        for name, line in self.lines.items():
-            line.set_data(x, self.series[name])
-        for ax in self.axes.ravel():
+        for name in ("actor_loss", "critic1_loss", "critic2_loss", "alpha_loss"):
+            self.lines[name].set_data(x, self.series[name])
+        for ax in self.loss_axes:
             ax.relim()
             ax.autoscale_view()
         self.fig.canvas.draw_idle()
         self.plt.pause(0.001)
 
+    def update_weights(self, log_entry):
+        """Append adaptive PPD/CO₂ scales from a sim log entry."""
+        if not self.show_adaptive_weights:
+            return
+        self.weight_step_count += 1
+        n = int(log_entry.get("adaptive_n_samples", 0) or 0)
+        x_val = n if n > 0 else self.weight_step_count
+        self.series["n_samples"].append(x_val)
+        self.series["comfort_scale"].append(float(log_entry.get("adaptive_comfort_scale", 1.0)))
+        self.series["co2_scale"].append(float(log_entry.get("adaptive_co2_scale", 1.0)))
+        ema_e = log_entry.get("adaptive_ema_energy")
+        ema_c = log_entry.get("adaptive_ema_comfort")
+        ema_co2 = log_entry.get("adaptive_ema_co2")
+        self.series["ema_energy"].append(float(ema_e) if ema_e is not None else np.nan)
+        self.series["ema_comfort"].append(float(ema_c) if ema_c is not None else np.nan)
+        self.series["ema_co2"].append(float(ema_co2) if ema_co2 is not None else np.nan)
+
+        active = bool(log_entry.get("adaptive_balancing_active", False))
+        if self._warmup_line is None and active and n > 0:
+            self._warmup_line = self.ax_scale.axvline(
+                n, color="gray", linestyle="--", alpha=0.7, linewidth=1.2, label="Warmup end"
+            )
+            self.ax_ema.axvline(n, color="gray", linestyle="--", alpha=0.7, linewidth=1.2)
+            self.ax_scale.legend(loc="best", fontsize=8)
+
+        if self.weight_step_count % self.update_every != 0:
+            return
+
+        x = self.series["n_samples"]
+        for name in ("comfort_scale", "co2_scale", "ema_energy", "ema_comfort", "ema_co2"):
+            self.lines[name].set_data(x, self.series[name])
+        self.ax_scale.relim()
+        self.ax_scale.autoscale_view()
+        self.ax_scale.set_ylim(-0.05, 1.05)
+        self.ax_ema.relim()
+        self.ax_ema.autoscale_view()
+        self.fig.canvas.draw_idle()
+        self.plt.pause(0.001)
+
     def finish(self, output_dir, hold=False):
-        path = Path(output_dir) / "sac_training_losses.png"
+        if self.show_losses and self.show_adaptive_weights:
+            name = "sac_losses_and_adaptive_weights.png"
+        elif self.show_adaptive_weights:
+            name = "adaptive_reward_weights.png"
+        else:
+            name = "sac_training_losses.png"
+        path = Path(output_dir) / name
         self.fig.savefig(path, dpi=150, bbox_inches="tight")
-        print(f"Saved SAC loss plot snapshot to {path}")
+        print(f"Saved training plot snapshot to {path}")
         if hold:
             self.plt.ioff()
             self.plt.show()
@@ -581,15 +930,444 @@ class LiveLossPlotter:
             self.plt.pause(0.001)
 
 
+class LiveEpisodeDollarKPIPlotter:
+    """Per-episode dollar costs plus physical KPIs (kWh, PPD, CO₂, people).
+
+    Dollar panel: absolute $ (converts from $/m² when needed).
+    Physical panel: summed electric/gas kWh and episode-mean PPD, CO₂, people.
+    """
+
+    def __init__(self, output_dir, floor_area_m2=None):
+        self.floor_area_m2 = float(floor_area_m2) if floor_area_m2 and floor_area_m2 > 0 else None
+        self._episode_sums = None
+        self._episode_phys = None
+        self._current_episode = None
+        self._norm_mode = None
+        mpl_cache_dir = Path(output_dir) / ".matplotlib-cache"
+        mpl_cache_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", str(mpl_cache_dir))
+
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.ticker as mticker
+        except ImportError as exc:
+            raise RuntimeError(
+                "Episode KPI plotting requires matplotlib. Install it in the active environment."
+            ) from exc
+
+        self.plt = plt
+        self.mticker = mticker
+        plt.ion()
+        self.fig = plt.figure(figsize=(12, 11), num="Episode KPIs")
+        gs = self.fig.add_gridspec(3, 2, height_ratios=[1.05, 1.0, 1.1], hspace=0.38, wspace=0.28)
+        self.ax_bars = self.fig.add_subplot(gs[0, :])
+        self.ax_lines = self.fig.add_subplot(gs[1, :])
+        self.ax_energy = self.fig.add_subplot(gs[2, 0])
+        self.ax_comfort = self.fig.add_subplot(gs[2, 1])
+        self.ax_gas = self.ax_energy.twinx()
+        self.ax_co2 = self.ax_comfort.twinx()
+        self.fig.suptitle("Episode KPIs", fontsize=12, fontweight="bold")
+
+        self.kpi_keys = (
+            ("energy_cost", "Electric $", "tab:red"),
+            ("gas_cost", "Gas $", "tab:green"),
+            ("comfort_penalty", "Thermal $", "darkgoldenrod"),
+            ("co2_penalty", "IAQ $", "tab:cyan"),
+            ("total_cost", "Total $", "black"),
+        )
+        self.phys_keys = (
+            "elec_kwh",
+            "gas_kwh",
+            "mean_ppd",
+            "mean_co2",
+            "mean_people",
+        )
+        self.series = {"episode": []}
+        for key, _, _ in self.kpi_keys:
+            self.series[key] = []
+        for key in self.phys_keys:
+            self.series[key] = []
+        self.lines = {}
+        self.phys_lines = {}
+        self.bars = None
+        self._setup_axes()
+
+    def _setup_axes(self):
+        self.ax_bars.set_ylabel("Episode cost ($)")
+        self.ax_bars.set_title(
+            "Dollar costs (stacked) — gas/IAQ $ often tiny vs electric/thermal",
+            fontsize=9, fontweight="bold",
+        )
+        self.ax_bars.grid(True, axis="y", alpha=0.3)
+
+        for key, label, color in self.kpi_keys:
+            linewidth = 2.2 if key == "total_cost" else 1.6
+            self.lines[key], = self.ax_lines.plot(
+                [], [], label=label, color=color, linewidth=linewidth, marker="o", markersize=4
+            )
+        self.ax_lines.set_ylabel("Episode cost ($)")
+        self.ax_lines.set_title("Dollar KPI trends", fontsize=9, fontweight="bold")
+        self.ax_lines.legend(loc="best", fontsize=8, ncol=3)
+        self.ax_lines.grid(True, alpha=0.3)
+        self.ax_lines.xaxis.set_major_locator(self.mticker.MaxNLocator(integer=True))
+
+        self.phys_lines["elec_kwh"], = self.ax_energy.plot(
+            [], [], label="Electric kWh", color="tab:red", linewidth=2.0, marker="o", markersize=4
+        )
+        self.phys_lines["gas_kwh"], = self.ax_gas.plot(
+            [], [], label="Gas kWh", color="tab:green", linewidth=2.0, marker="s", markersize=4
+        )
+        self.ax_energy.set_xlabel("Episode")
+        self.ax_energy.set_ylabel("Electric (kWh)", color="tab:red")
+        self.ax_gas.set_ylabel("Gas (kWh)", color="tab:green")
+        self.ax_energy.set_title("Physical energy use", fontsize=9, fontweight="bold")
+        self.ax_energy.grid(True, alpha=0.3)
+        self.ax_energy.tick_params(axis="y", labelcolor="tab:red")
+        self.ax_gas.tick_params(axis="y", labelcolor="tab:green")
+        energy_handles = [self.phys_lines["elec_kwh"], self.phys_lines["gas_kwh"]]
+        self.ax_energy.legend(energy_handles, [h.get_label() for h in energy_handles], loc="best", fontsize=8)
+
+        self.phys_lines["mean_ppd"], = self.ax_comfort.plot(
+            [], [], label="Mean PPD (%)", color="darkgoldenrod", linewidth=2.0, marker="o", markersize=4
+        )
+        self.phys_lines["mean_people"], = self.ax_comfort.plot(
+            [], [], label="Mean people", color="tab:olive", linewidth=1.6, marker="^", markersize=4, alpha=0.85
+        )
+        self.phys_lines["mean_co2"], = self.ax_co2.plot(
+            [], [], label="Mean zone CO₂ (ppm)", color="tab:cyan", linewidth=2.0, marker="s", markersize=4
+        )
+        self.ax_comfort.set_xlabel("Episode")
+        self.ax_comfort.set_ylabel("PPD (%) / people")
+        self.ax_co2.set_ylabel("CO₂ (ppm)", color="tab:cyan")
+        self.ax_comfort.set_title("Physical comfort / IAQ / occupancy", fontsize=9, fontweight="bold")
+        self.ax_comfort.grid(True, alpha=0.3)
+        self.ax_co2.tick_params(axis="y", labelcolor="tab:cyan")
+        comfort_handles = [
+            self.phys_lines["mean_ppd"],
+            self.phys_lines["mean_people"],
+            self.phys_lines["mean_co2"],
+        ]
+        self.ax_comfort.legend(
+            comfort_handles, [h.get_label() for h in comfort_handles], loc="best", fontsize=7
+        )
+        for ax in (self.ax_energy, self.ax_comfort):
+            ax.xaxis.set_major_locator(self.mticker.MaxNLocator(integer=True))
+
+        self.fig.canvas.draw_idle()
+        self.plt.pause(0.001)
+
+    def _to_absolute_dollars(self, log_entry, key):
+        """Convert a logged cost term to absolute $ for the timestep."""
+        value = float(log_entry.get(key, 0.0) or 0.0)
+        mode = str(log_entry.get("cost_normalization_mode", "absolute")).lower()
+        self._norm_mode = mode
+        if mode == "per_m2":
+            area = self.floor_area_m2
+            if area is None:
+                factor = log_entry.get("cost_normalization_factor")
+                if factor:
+                    area = 1.0 / float(factor)
+            if area:
+                return value * float(area)
+        return value
+
+    @staticmethod
+    def _mean_log_prefix(log_entry, prefix):
+        values = [
+            float(v)
+            for k, v in log_entry.items()
+            if str(k).startswith(prefix) and v is not None and not (isinstance(v, float) and np.isnan(v))
+        ]
+        return float(np.mean(values)) if values else np.nan
+
+    def _empty_phys(self):
+        return {
+            "elec_kwh": 0.0,
+            "gas_kwh": 0.0,
+            "ppd_sum": 0.0,
+            "ppd_n": 0,
+            "co2_sum": 0.0,
+            "co2_n": 0,
+            "people_sum": 0.0,
+            "people_n": 0,
+        }
+
+    def _ensure_episode(self, episode):
+        episode = int(episode)
+        if self._current_episode is None:
+            self._current_episode = episode
+            self._episode_sums = {key: 0.0 for key, _, _ in self.kpi_keys}
+            self._episode_phys = self._empty_phys()
+            return
+        if episode != self._current_episode:
+            self._finalize_current_episode()
+            self._current_episode = episode
+            self._episode_sums = {key: 0.0 for key, _, _ in self.kpi_keys}
+            self._episode_phys = self._empty_phys()
+
+    def update_step(self, log_entry):
+        """Accumulate dollar and physical KPIs for the current episode timestep."""
+        episode = int(log_entry["episode"])
+        self._ensure_episode(episode)
+        for key, _, _ in self.kpi_keys:
+            self._episode_sums[key] += self._to_absolute_dollars(log_entry, key)
+
+        phys = self._episode_phys
+        phys["elec_kwh"] += float(log_entry.get("energy_kwh", 0.0) or 0.0)
+        phys["gas_kwh"] += float(log_entry.get("gas_kwh", 0.0) or 0.0)
+
+        ppd = self._mean_log_prefix(log_entry, "ppd_")
+        if not np.isnan(ppd):
+            phys["ppd_sum"] += ppd
+            phys["ppd_n"] += 1
+
+        co2 = self._mean_log_prefix(log_entry, "co2_")
+        if not np.isnan(co2):
+            phys["co2_sum"] += co2
+            phys["co2_n"] += 1
+
+        people = log_entry.get("people", np.nan)
+        if people is not None and not (isinstance(people, float) and np.isnan(people)):
+            phys["people_sum"] += float(people)
+            phys["people_n"] += 1
+
+    def finalize_episode(self, episode=None):
+        """Push the completed episode totals onto the chart."""
+        if episode is not None and self._current_episode is None:
+            self._current_episode = int(episode)
+        self._finalize_current_episode()
+
+    def _finalize_current_episode(self):
+        if self._current_episode is None or self._episode_sums is None:
+            return
+
+        self.series["episode"].append(int(self._current_episode))
+        for key, _, _ in self.kpi_keys:
+            self.series[key].append(float(self._episode_sums[key]))
+
+        phys = self._episode_phys or self._empty_phys()
+        self.series["elec_kwh"].append(float(phys["elec_kwh"]))
+        self.series["gas_kwh"].append(float(phys["gas_kwh"]))
+        self.series["mean_ppd"].append(
+            phys["ppd_sum"] / phys["ppd_n"] if phys["ppd_n"] else np.nan
+        )
+        self.series["mean_co2"].append(
+            phys["co2_sum"] / phys["co2_n"] if phys["co2_n"] else np.nan
+        )
+        self.series["mean_people"].append(
+            phys["people_sum"] / phys["people_n"] if phys["people_n"] else np.nan
+        )
+
+        self._redraw()
+        self._current_episode = None
+        self._episode_sums = None
+        self._episode_phys = None
+
+    def _redraw(self):
+        episodes = self.series["episode"]
+        if not episodes:
+            return
+
+        self.ax_bars.clear()
+        self.ax_bars.set_ylabel("Episode cost ($)")
+        self.ax_bars.set_title(
+            "Dollar costs (stacked) — gas/IAQ $ often tiny vs electric/thermal",
+            fontsize=9, fontweight="bold",
+        )
+        self.ax_bars.grid(True, axis="y", alpha=0.3)
+
+        x = np.asarray(episodes, dtype=float)
+        bottom = np.zeros(len(episodes), dtype=float)
+        width = 0.65
+        for key, label, color in self.kpi_keys:
+            if key == "total_cost":
+                continue
+            vals = np.asarray(self.series[key], dtype=float)
+            self.ax_bars.bar(
+                x, vals, width=width, bottom=bottom, label=label, color=color, alpha=0.85
+            )
+            bottom = bottom + vals
+        self.ax_bars.plot(
+            x, self.series["total_cost"], color="black", marker="o",
+            linestyle="None", markersize=5, label="Total $", zorder=5
+        )
+        self.ax_bars.legend(loc="best", fontsize=8, ncol=3)
+        self.ax_bars.xaxis.set_major_locator(self.mticker.MaxNLocator(integer=True))
+
+        for key, _, _ in self.kpi_keys:
+            self.lines[key].set_data(episodes, self.series[key])
+        self.ax_lines.relim()
+        self.ax_lines.autoscale_view()
+        self.ax_lines.xaxis.set_major_locator(self.mticker.MaxNLocator(integer=True))
+
+        self.phys_lines["elec_kwh"].set_data(episodes, self.series["elec_kwh"])
+        self.phys_lines["gas_kwh"].set_data(episodes, self.series["gas_kwh"])
+        self.phys_lines["mean_ppd"].set_data(episodes, self.series["mean_ppd"])
+        self.phys_lines["mean_people"].set_data(episodes, self.series["mean_people"])
+        self.phys_lines["mean_co2"].set_data(episodes, self.series["mean_co2"])
+        for ax in (self.ax_energy, self.ax_gas, self.ax_comfort, self.ax_co2):
+            ax.relim()
+            ax.autoscale_view()
+        for ax in (self.ax_energy, self.ax_comfort):
+            ax.xaxis.set_major_locator(self.mticker.MaxNLocator(integer=True))
+
+        unit_note = ""
+        if self._norm_mode == "per_m2" and self.floor_area_m2:
+            unit_note = f" — $ from $/m² × {self.floor_area_m2:.0f} m²"
+        self.fig.suptitle(f"Episode KPIs{unit_note}", fontsize=12, fontweight="bold")
+        self.fig.canvas.draw_idle()
+        self.plt.pause(0.001)
+
+    def finish(self, output_dir, hold=False):
+        if self._episode_sums is not None and self._current_episode is not None:
+            self._finalize_current_episode()
+        path = Path(output_dir) / "episode_dollar_kpis.png"
+        self.fig.savefig(path, dpi=150, bbox_inches="tight")
+        print(f"Saved episode KPI plot to {path}")
+        csv_path = Path(output_dir) / "episode_dollar_kpis.csv"
+        rows = []
+        for i, ep in enumerate(self.series["episode"]):
+            row = {"episode": ep}
+            for key, _, _ in self.kpi_keys:
+                row[key] = self.series[key][i]
+            for key in self.phys_keys:
+                row[key] = self.series[key][i]
+            rows.append(row)
+        if rows:
+            pd.DataFrame(rows).to_csv(csv_path, index=False)
+            print(f"Saved episode KPI table to {csv_path}")
+        if hold:
+            self.plt.ioff()
+            self.plt.show()
+        else:
+            self.plt.pause(0.001)
+
+
+class AdaptiveCostBalancer:
+    """Online scales for thermal/IAQ $ so their running means track energy $.
+
+    Tracks EMA of energy (electric+gas), raw PPD productivity $, and raw CO₂
+    productivity $. After ``min_samples``, sets:
+
+        scale_c = clip(comfort_target_ratio * ema_energy / ema_comfort, …)
+        scale_co2 = clip(co2_target_ratio * ema_energy / ema_co2, …)
+
+    With ``weight_max: 1.0`` (default) this only scales productivity *down* when
+    it dominates energy — it never amplifies above the static ``comfort_weight`` /
+    ``co2_weight``. Warmup leaves scales at ``initial_scale`` (default 1.0).
+    """
+
+    def __init__(self, cfg=None):
+        cfg = cfg or {}
+        self.enabled = bool(cfg.get('enabled', False))
+        self.ema_alpha = float(cfg.get('ema_alpha', 0.01))
+        self.min_samples = int(cfg.get('min_samples', 100))
+        self.comfort_target_ratio = float(cfg.get('comfort_target_ratio', 1.0))
+        self.co2_target_ratio = float(cfg.get('co2_target_ratio', 1.0))
+        self.weight_min = float(cfg.get('weight_min', 0.0))
+        self.weight_max = float(cfg.get('weight_max', 1.0))
+        self.initial_scale = float(cfg.get('initial_scale', 1.0))
+        self.min_mean = float(cfg.get('min_mean', 1e-12))
+        self.ema_energy = None
+        self.ema_comfort = None
+        self.ema_co2 = None
+        self.n_samples = 0
+        self.comfort_scale = self.initial_scale
+        self.co2_scale = self.initial_scale
+
+    @staticmethod
+    def _ema(prev, value, alpha):
+        if prev is None:
+            return float(value)
+        return (1.0 - alpha) * float(prev) + alpha * float(value)
+
+    def update_and_get_scales(self, energy_ref, comfort_raw, co2_raw):
+        """Update running means; return dict of scales and diagnostics."""
+        if not self.enabled:
+            return {
+                'comfort': 1.0,
+                'co2': 1.0,
+                'ema_energy': None,
+                'ema_comfort': None,
+                'ema_co2': None,
+                'n_samples': 0,
+                'active': False,
+            }
+
+        energy_ref = max(0.0, float(energy_ref))
+        comfort_raw = max(0.0, float(comfort_raw))
+        co2_raw = max(0.0, float(co2_raw))
+
+        self.ema_energy = self._ema(self.ema_energy, energy_ref, self.ema_alpha)
+        self.ema_comfort = self._ema(self.ema_comfort, comfort_raw, self.ema_alpha)
+        self.ema_co2 = self._ema(self.ema_co2, co2_raw, self.ema_alpha)
+        self.n_samples += 1
+
+        active = self.n_samples >= self.min_samples
+        if active:
+            if self.ema_comfort is not None and self.ema_comfort > self.min_mean:
+                self.comfort_scale = float(np.clip(
+                    self.comfort_target_ratio * self.ema_energy / self.ema_comfort,
+                    self.weight_min,
+                    self.weight_max,
+                ))
+            if self.ema_co2 is not None and self.ema_co2 > self.min_mean:
+                self.co2_scale = float(np.clip(
+                    self.co2_target_ratio * self.ema_energy / self.ema_co2,
+                    self.weight_min,
+                    self.weight_max,
+                ))
+
+        return {
+            'comfort': self.comfort_scale if active else self.initial_scale,
+            'co2': self.co2_scale if active else self.initial_scale,
+            'ema_energy': self.ema_energy,
+            'ema_comfort': self.ema_comfort,
+            'ema_co2': self.ema_co2,
+            'n_samples': self.n_samples,
+            'active': active,
+        }
+
+    def state_dict(self):
+        """Serialize running stats for checkpoint resume."""
+        return {
+            'ema_energy': self.ema_energy,
+            'ema_comfort': self.ema_comfort,
+            'ema_co2': self.ema_co2,
+            'n_samples': int(self.n_samples),
+            'comfort_scale': float(self.comfort_scale),
+            'co2_scale': float(self.co2_scale),
+        }
+
+    def load_state_dict(self, state):
+        """Restore running stats from a checkpoint (ignores None / empty)."""
+        if not state:
+            return False
+        self.ema_energy = state.get('ema_energy', None)
+        self.ema_comfort = state.get('ema_comfort', None)
+        self.ema_co2 = state.get('ema_co2', None)
+        self.n_samples = int(state.get('n_samples', 0) or 0)
+        if 'comfort_scale' in state and state['comfort_scale'] is not None:
+            self.comfort_scale = float(state['comfort_scale'])
+        if 'co2_scale' in state and state['co2_scale'] is not None:
+            self.co2_scale = float(state['co2_scale'])
+        return True
+
+
 class HVACEnvironment:
     """Environment wrapper for EnergyPlus HVAC control with RL agent."""
     
-    def __init__(self, api, state, config_path=None):
+    def __init__(self, api, state, config_path=None, simulation_overrides=None):
         self.api = api
         self.state = state
         
         # Load HVAC configuration
         self.hvac_config = get_hvac_config(config_path)
+        if simulation_overrides:
+            sim_cfg = self.hvac_config.config.setdefault('simulation', {})
+            for key, value in simulation_overrides.items():
+                if value is not None:
+                    sim_cfg[key] = value
         
         # Control parameters from config
         self.base_temp = self.hvac_config.base_temperature
@@ -610,6 +1388,13 @@ class HVACEnvironment:
         self.prev_temp = None
         self.prev_energy = None
 
+        # Online PPD/CO2 reward scales vs observed energy $ (see AdaptiveCostBalancer)
+        reward_cfg = self.hvac_config.config.get('reward') or {}
+        self.adaptive_cost_balancer = AdaptiveCostBalancer(
+            reward_cfg.get('adaptive_balancing')
+        )
+        self._last_reward_components = None
+
         # Cached power (W) from callback_after_predictor_after_hvac_managers
         # (electricity and gas demand rates reset before zone timestep callback fires)
         self._cached_power_w = None
@@ -625,6 +1410,13 @@ class HVACEnvironment:
         #                                          Only override the fields you include.
         self.outdoor_co2_override = None
         self.weather_override = None
+
+        # Occupancy events: config-driven per-zone occupancy spikes/drops applied on
+        # top of the model's normal People schedule (see apply_occupancy_events_for_current_timestep).
+        self.occupancy_events_cfg = self.hvac_config.config.get('occupancy_events', {}) or {}
+        # zone_name -> calibrated design occupant count (Area/Person "full occupancy" level),
+        # lazily learned at runtime from the natural (un-overridden) schedule-driven occupancy.
+        self._occupancy_design_people = {}
 
         # Handles (initialized during warmup)
         self.handles_initialized = False
@@ -718,15 +1510,16 @@ class HVACEnvironment:
             zone_handles['heating_sp'] = exchange.get_actuator_handle(
                 self.state, "Zone Temperature Control", "Heating Setpoint", zone_name
             )
-            zone_handles['airflow'] = exchange.get_actuator_handle(
-                self.state, "Zone Infiltration", "Air Exchange Flow Rate",
-                f"{zone_name} Infiltration"
-            )
             zone_handles['co2'] = exchange.get_variable_handle(
                 self.state, "Zone Air CO2 Concentration", zone_name
             )
             zone_handles['people'] = exchange.get_variable_handle(
                 self.state, "Zone People Occupant Count", zone_name
+            )
+            # Actuator to override occupant count for occupancy_events (component name
+            # matches the People object's Name field, which is the zone name in this model).
+            zone_handles['people_actuator'] = exchange.get_actuator_handle(
+                self.state, "People", "Number of People", zone_name
             )
             # Thermal comfort (Fanger) – PPD and PMV; optional, logged as NaN if unavailable
             zone_handles['ppd'] = exchange.get_variable_handle(
@@ -742,6 +1535,34 @@ class HVACEnvironment:
                 raise RuntimeError(f"EnergyPlus handle(s) invalid for zone '{zone_name}': {critical}")
 
             self.handles['zones'][zone_name] = zone_handles
+
+        self.handles['ahu_oa'] = {}
+        for floor, info in AHU_OA_CONTROLS.items():
+            oa_handles = {}
+            airloop_name = info['airloop']
+            controller_name = info['controller']
+            oa_handles['commanded_mass_flow'] = exchange.get_actuator_handle(
+                self.state, "Outdoor Air Controller", "Air Mass Flow Rate", controller_name
+            )
+            oa_handles['mass_flow'] = exchange.get_variable_handle(
+                self.state, "Air System Outdoor Air Mass Flow Rate", airloop_name
+            )
+            oa_handles['mech_vent_request'] = exchange.get_variable_handle(
+                self.state,
+                "Air System Outdoor Air Mechanical Ventilation Requested Mass Flow Rate",
+                airloop_name,
+            )
+            if oa_handles['commanded_mass_flow'] <= 0:
+                raise RuntimeError(
+                    f"EnergyPlus handle invalid for AHU OA controller actuator '{controller_name}'. "
+                    "Check eplusout.edd for Outdoor Air Controller / Air Mass Flow Rate actuator names."
+                )
+            if oa_handles['mass_flow'] <= 0:
+                raise RuntimeError(
+                    f"EnergyPlus handle invalid for AHU OA mass-flow variable on '{airloop_name}'. "
+                    "Declare 'Air System Outdoor Air Mass Flow Rate' as an Output:Variable."
+                )
+            self.handles['ahu_oa'][floor] = oa_handles
 
         # Energy consumption: "Facility Total Electricity Demand Rate" [W], key "*"
         # This variable must be declared in IDF as Output:Variable (injected by create_custom_idf).
@@ -760,6 +1581,14 @@ class HVACEnvironment:
         # Outdoor CO2 schedule actuator — set_actuator_value overrides the schedule each step
         self.handles['outdoor_co2'] = exchange.get_actuator_handle(
             self.state, "Schedule:Constant", "Schedule Value", "Outdoor CO2 Schedule"
+        )
+
+        # Occupancy events: natural (schedule-driven) occupancy fraction, read independently
+        # of any People actuator override — requires Output:Variable injected by create_custom_idf.
+        occ_schedule_name = self.occupancy_events_cfg.get('schedule_name')
+        self.handles['occupancy_schedule'] = (
+            exchange.get_variable_handle(self.state, "Schedule Value", occ_schedule_name)
+            if occ_schedule_name else -1
         )
 
         # Weather Data actuators — override EPW values each step via apply_weather_override().
@@ -835,7 +1664,101 @@ class HVACEnvironment:
             h = weather_handles.get(key, -1)
             if h and h > 0:
                 exchange.set_actuator_value(self.state, h, float(value))
-    
+
+    def _resolve_occupancy_event_zones(self, zone_refs):
+        """Expand an occupancy event's `zones` list. Entries matching a FLOOR_ZONE_GROUPS
+        key ("bottom"/"mid"/"top") expand to that floor's zones; anything else is treated
+        as an exact zone name. Unknown zone names are silently dropped."""
+        resolved = []
+        for ref in zone_refs:
+            for zone_name in FLOOR_ZONE_GROUPS.get(ref, [ref]):
+                if zone_name in self.handles.get('zones', {}):
+                    resolved.append(zone_name)
+        return resolved
+
+    @staticmethod
+    def _occupancy_event_in_date_range(event, month, day):
+        """Optional start/end month-day restriction on an event; defaults to active on
+        every simulated day when not given."""
+        start_month = event.get('start_month')
+        end_month = event.get('end_month')
+        if start_month is None or end_month is None:
+            return True
+        start = (start_month, event.get('start_day') or 1)
+        end = (end_month, event.get('end_day') or 31)
+        return start <= (month, day) <= end
+
+    def apply_occupancy_events_for_current_timestep(self):
+        """Override per-zone People counts for configured occupancy spike/drop events
+        (config: occupancy_events). Zones/hours with no active event have their
+        actuator reset so EnergyPlus's normal People schedule (and CO2 generation)
+        drives occupancy as usual.
+
+        Each event's delta (e.g. +0.4, -0.3) scales the *natural* scheduled occupancy
+        for that hour, read from occupancy_events.schedule_name's "Schedule Value"
+        output — which reflects the real schedule regardless of any actuator override,
+        so events compose correctly with the model's normal daily occupancy pattern.
+        The absolute per-zone design occupant count (Area/Person "full occupancy"
+        level) isn't directly queryable via the EnergyPlus Python API, so it's
+        calibrated lazily from the natural (un-overridden) occupant count the first
+        time each zone is observed with no active event, using zone_time_step_number
+        > 1 to guarantee the previous timestep's report is from the same clock hour
+        (same schedule fraction) and therefore comparable, not lagged into a
+        different hour's occupancy level.
+        """
+        if not self.handles_initialized:
+            return
+        cfg = self.occupancy_events_cfg
+        if not cfg.get('enabled', False):
+            return
+        events = cfg.get('events', [])
+        if not events:
+            return
+
+        exchange = self.api.exchange
+        sched_handle = self.handles.get('occupancy_schedule', -1)
+        if sched_handle is None or sched_handle <= 0:
+            return
+        schedule_fraction = exchange.get_variable_value(self.state, sched_handle)
+
+        hour = exchange.hour(self.state)
+        month = exchange.month(self.state)
+        day = exchange.day_of_month(self.state)
+        zone_time_step = exchange.zone_time_step_number(self.state)
+
+        active_multiplier = {}
+        for event in events:
+            if hour not in event.get('hours', []):
+                continue
+            if not self._occupancy_event_in_date_range(event, month, day):
+                continue
+            multiplier = 1.0 + float(event.get('delta', 0.0))
+            for zone_name in self._resolve_occupancy_event_zones(event.get('zones', [])):
+                active_multiplier[zone_name] = active_multiplier.get(zone_name, 1.0) * multiplier
+
+        for zone_name, zhandles in self.handles['zones'].items():
+            actuator_handle = zhandles.get('people_actuator', -1)
+            if actuator_handle is None or actuator_handle <= 0:
+                continue
+
+            if zone_name in active_multiplier:
+                design_people = self._occupancy_design_people.get(zone_name)
+                if design_people is None:
+                    # Not yet calibrated (e.g. event fires before any normal occupied
+                    # hour has been observed) — leave the natural schedule in effect.
+                    continue
+                new_count = max(0.0, design_people * schedule_fraction * active_multiplier[zone_name])
+                exchange.set_actuator_value(self.state, actuator_handle, new_count)
+            else:
+                exchange.reset_actuator(self.state, actuator_handle)
+                if (
+                    zone_name not in self._occupancy_design_people
+                    and zone_time_step > 1
+                    and schedule_fraction > 1e-3
+                ):
+                    natural_count = exchange.get_variable_value(self.state, zhandles['people'])
+                    self._occupancy_design_people[zone_name] = natural_count / schedule_fraction
+
     _WEATHER_GETTERS = {
         'oat': ('outdoor_dry_bulb', ),
         'humidity': ('outdoor_relative_humidity', ),
@@ -870,20 +1793,58 @@ class HVACEnvironment:
         getter = getattr(exchange, f"{prefix}_weather_{suffix}_at_time")
         return getter(self.state, hour, ts)
 
+    def _zone_temp_value(self, zone_name):
+        """Read one zone mean air temperature (°C) from EnergyPlus."""
+        zhandles = self.handles['zones'].get(zone_name)
+        if not zhandles or zhandles.get('temp', -1) <= 0:
+            raise RuntimeError(f"Missing temperature handle for zone '{zone_name}'")
+        return float(self.api.exchange.get_variable_value(self.state, zhandles['temp']))
+
+    def _get_zone_temp_features(self):
+        """Build zone-temperature state features from config zone_temps.mode.
+
+        modes:
+          zones          — one temp per controlled zone (15)
+          perimeter_core — core_bottom/mid/top + mean perimeter temp per floor (6)
+          floor          — mean temp of all zones on each floor: bottom, mid, top (3)
+        """
+        mode = self.hvac_config.config['state_space']['zone_temps'].get('mode', 'zones')
+        expected = self.hvac_config.config['state_space']['zone_temps']['count']
+
+        if mode == 'zones':
+            zone_temps = [
+                self._zone_temp_value(zone_name)
+                for zone_name in list(self.handles['zones'].keys())[:expected]
+            ]
+        elif mode == 'perimeter_core':
+            zone_temps = []
+            for floor in FLOOR_ORDER:
+                zone_temps.append(self._zone_temp_value(CORE_ZONE_BY_FLOOR[floor]))
+            for floor in FLOOR_ORDER:
+                perim_temps = [self._zone_temp_value(z) for z in PERIMETER_ZONE_GROUPS[floor]]
+                zone_temps.append(float(np.mean(perim_temps)))
+        elif mode == 'floor':
+            zone_temps = []
+            for floor in FLOOR_ORDER:
+                floor_temps = [self._zone_temp_value(z) for z in FLOOR_ZONE_GROUPS[floor]]
+                zone_temps.append(float(np.mean(floor_temps)))
+        else:
+            raise RuntimeError(f"Unsupported state_space.zone_temps.mode: {mode!r}")
+
+        if len(zone_temps) != expected:
+            raise RuntimeError(
+                f"zone_temps mode={mode!r} produced {len(zone_temps)} features, "
+                f"expected count={expected}"
+            )
+        return zone_temps
+
     def get_current_state(self):
         """Get current environment state from EnergyPlus."""
         exchange = self.api.exchange
         
-        # Get zone temperatures from config
-        zone_count = self.hvac_config.config['state_space']['zone_temps']['count']
-        zone_temps = []
-        
-        # Get actual zone temperatures from EnergyPlus
-        zone_names = list(self.handles['zones'].keys())[:zone_count]
-        for zone_name in zone_names:
-            temp = exchange.get_variable_value(self.state, self.handles['zones'][zone_name]['temp'])
-            zone_temps.append(temp)
-        zone_temps = zone_temps[:zone_count]
+        # Zone temperatures: per-zone, perimeter_core, or floor averages
+        zone_temps = self._get_zone_temp_features()
+        zone_count = len(zone_temps)
 
         # Current weather from EnergyPlus weather API (actual EPW/override values, no fallback)
         current_hour_for_weather = exchange.hour(self.state)
@@ -938,27 +1899,38 @@ class HVACEnvironment:
         current_hour = exchange.hour(self.state)
         current_day = exchange.day_of_month(self.state)
         current_month = exchange.month(self.state)
-        
+        current_year = 2023
+        if hasattr(exchange, 'year'):
+            year_val = exchange.year(self.state)
+            if year_val and int(year_val) > 0:
+                current_year = int(year_val)
+
+        # Day of week: Monday=0 .. Sunday=6, normalized to [0, 1]
+        day_of_week = datetime(current_year, current_month, current_day).weekday() / 6.0
+
         # Normalize to [0, 1] range
         time_features = [
             current_hour / 24.0,  # Hour of day
-            0,  # Day of week (placeholder - would need proper calculation)
+            day_of_week,         # Day of week
             current_month / 12.0  # Month of year
         ]
         
-        # Previous action. The first timestep has no previous control action,
-        # so that initial vector must be specified in the config.
-        if self.current_action is not None:
-            prev_action = self.current_action
+        # Optional previous action features. Set previous_actions.count: 0 to exclude
+        # these from the state while still using the same action space.
+        prev_cfg = self.hvac_config.config['state_space'].get('previous_actions', {})
+        prev_count = prev_cfg.get('count', 0)
+        if prev_count <= 0:
+            prev_action = []
+        elif self.current_action is not None:
+            prev_action = list(self.current_action)[:prev_count]
         else:
-            prev_cfg = self.hvac_config.config['state_space']['previous_actions']
             prev_action = prev_cfg.get('initial_value')
             if prev_action is None:
                 raise RuntimeError(
                     "state_space.previous_actions.initial_value is required "
-                    "for the first control timestep"
+                    "when state_space.previous_actions.count is greater than zero"
                 )
-            if len(prev_action) != prev_cfg['count']:
+            if len(prev_action) != prev_count:
                 raise RuntimeError(
                     "state_space.previous_actions.initial_value length must match "
                     "state_space.previous_actions.count"
@@ -968,13 +1940,31 @@ class HVACEnvironment:
         outdoor_co2 = self.get_outdoor_co2_ppm(current_month, current_day, current_hour)
         co2_outdoor = [float(outdoor_co2)]
         
-        # Zone CO2 (ppm) for the same zones as zone_temps
-        zone_co2_list = []
-        zone_co2_count = self.hvac_config.config['state_space'].get('zone_co2_ppm', {}).get('count', zone_count)
-        for i, (zone_name, zhandles) in enumerate(self.handles['zones'].items()):
-            if i >= zone_co2_count:
-                break
-            zone_co2_list.append(exchange.get_variable_value(self.state, zhandles['co2']))
+        # Average zone return-air CO2 (ppm) per floor
+        floor_co2_list = []
+        floor_co2_count = self.hvac_config.config['state_space'].get('floor_co2_ppm', {}).get('count', 0)
+        for floor in FLOOR_ORDER[:floor_co2_count]:
+            co2_values = []
+            for zone_name in FLOOR_ZONE_GROUPS[floor]:
+                zhandles = self.handles['zones'].get(zone_name)
+                if zhandles and zhandles.get('co2', -1) > 0:
+                    co2_values.append(exchange.get_variable_value(self.state, zhandles['co2']))
+            floor_co2_list.append(float(np.mean(co2_values)) if co2_values else 0.0)
+
+        # Electricity RTP ($/kWh): current hour + 1-hour-ahead (published hour-ahead price)
+        rtp_price_list = []
+        rtp_count = self.hvac_config.config['state_space'].get('rtp_price', {}).get('count', 0)
+        if rtp_count > 0:
+            reward_config = self.hvac_config.config['reward']
+            price_now = get_realtime_price(current_month, current_day, current_hour, reward_config)
+            rtp_price_list.append(float(price_now))
+            if rtp_count > 1:
+                ahead = datetime(current_year, current_month, current_day, current_hour) + timedelta(hours=1)
+                price_ahead = get_realtime_price(ahead.month, ahead.day, ahead.hour, reward_config)
+                rtp_price_list.append(float(price_ahead))
+            while len(rtp_price_list) < rtp_count:
+                rtp_price_list.append(rtp_price_list[-1] if rtp_price_list else 0.0)
+            rtp_price_list = rtp_price_list[:rtp_count]
         
         # Ensure all are lists (not numpy arrays) before concatenation
         zone_temps = list(zone_temps)
@@ -985,8 +1975,11 @@ class HVACEnvironment:
         prev_action = list(prev_action)
 
         # Combine all features (should match config state_size): temps, weather, forecast,
-        # past weather (optional), time, prev_action, outdoor_co2, zone_co2
-        all_features = zone_temps + current_weather + forecast_weather + past_weather + time_features + prev_action + co2_outdoor + zone_co2_list
+        # past weather (optional), time, optional prev_action, outdoor_co2, floor_co2, rtp
+        all_features = (
+            zone_temps + current_weather + forecast_weather + past_weather
+            + time_features + prev_action + co2_outdoor + floor_co2_list + rtp_price_list
+        )
         state = np.array(all_features[:self.state_size], dtype=np.float32)
 
         if self.hvac_config.is_normalization_enabled():
@@ -1010,7 +2003,12 @@ class HVACEnvironment:
             return low + (np.clip(a, -1.0, 1.0) + 1.0) / 2.0 * (high - low)
         sp_offset = scale(action[0], action_bounds['sp_offset'][0], action_bounds['sp_offset'][1])
         deadband = scale(action[1], action_bounds['deadband'][0], action_bounds['deadband'][1])
-        airflow_mult = scale(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1])
+        # Bounds come from config. For economizer-scale control, the max should be
+        # near the largest autosized OA controller maximum: about 4.94 m3/s * 1.2 kg/m3 ~= 6 kg/s.
+        oa_mass_flow = max(
+            0.0,
+            scale(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1]),
+        )
         
         # Calculate setpoints
         heating_sp = self.base_temp + sp_offset - deadband/2
@@ -1022,30 +2020,78 @@ class HVACEnvironment:
                 exchange.set_actuator_value(self.state, handles['heating_sp'], heating_sp)
             if handles['cooling_sp'] > 0:
                 exchange.set_actuator_value(self.state, handles['cooling_sp'], cooling_sp)
-            if handles['airflow'] > 0:
-                airflow = self.min_airflow + (self.max_airflow - self.min_airflow) * airflow_mult
-                exchange.set_actuator_value(self.state, handles['airflow'], airflow)
+
+        for handles in self.handles.get('ahu_oa', {}).values():
+            if handles['commanded_mass_flow'] > 0:
+                exchange.set_actuator_value(self.state, handles['commanded_mass_flow'], oa_mass_flow)
         
         self.current_action = action
     
-    def _compute_comfort_penalty(self, reward_config, zone_temps):
-        """Compute thermal comfort penalty from config: either temperature-based or PPD-based."""
+    def _zone_people_and_ppd(self):
+        """Return list of (people_count, ppd) for controlled zones with valid handles."""
+        exchange = self.api.exchange
+        rows = []
+        for zone_name, zhandles in self.handles.get('zones', {}).items():
+            people = 0.0
+            h_people = zhandles.get('people', -1)
+            if h_people and h_people > 0:
+                people = float(exchange.get_variable_value(self.state, h_people))
+            ppd = None
+            h_ppd = zhandles.get('ppd', -1)
+            if h_ppd and h_ppd > 0:
+                ppd = float(exchange.get_variable_value(self.state, h_ppd))
+            rows.append((people, ppd))
+        return rows
+
+    def _productivity_cost_from_loss(self, loss_frac, people, reward_config, dt_hours):
+        """Convert fractional productivity loss to $ for this timestep."""
+        wage = float(reward_config.get('labor_cost_per_person_hour', 40.0))
+        return max(0.0, float(loss_frac)) * max(0.0, float(people)) * wage * dt_hours
+
+    def _compute_comfort_penalty(self, reward_config, zone_temps, dt_hours=None, apply_static_weight=True):
+        """Thermal penalty: temperature, soft PPD, or PPD→productivity $ cost.
+
+        ppd_productivity sources (order-of-magnitude linear proxy):
+          ASHRAE 55 (~10% PPD design); Kosonen & Tan (PMV/PPD–productivity);
+          Lan, Wargocki & Lian (2011) Energy and Buildings; Seppänen/Fisk thermal
+          performance reviews. Slope ppd_productivity_loss_per_percent is tunable.
+
+        If apply_static_weight is False, return the raw cost before comfort_weight
+        (used for adaptive balancing).
+        """
         model = reward_config.get('thermal_comfort_model', 'temperature')
-        COMFORT_WEIGHT = reward_config['comfort_weight']
+        COMFORT_WEIGHT = float(reward_config['comfort_weight'])
+        if dt_hours is None:
+            dt_hours = 1.0 / self.timesteps_per_hour
+
+        if model == 'ppd_productivity':
+            # Occupant-weighted PPD → productivity loss → $
+            # loss_frac = clamp((PPD - ppd_ref) * loss_per_ppd_point / 100, 0, max_loss)
+            if not self.handles_initialized:
+                return 0.0
+            ppd_ref = float(reward_config.get('ppd_reference', 10.0))
+            loss_per_ppd = float(reward_config.get('ppd_productivity_loss_per_percent', 0.5))
+            max_loss = float(reward_config.get('ppd_max_productivity_loss', 0.15))
+            cost = 0.0
+            for people, ppd in self._zone_people_and_ppd():
+                if ppd is None or people <= 0.0:
+                    continue
+                loss_frac = np.clip((ppd - ppd_ref) * loss_per_ppd / 100.0, 0.0, max_loss)
+                cost += self._productivity_cost_from_loss(loss_frac, people, reward_config, dt_hours)
+            return cost * COMFORT_WEIGHT if apply_static_weight else cost
+
         if model == 'ppd':
-            # PPD-based: penalty when zone PPD exceeds acceptable (requires Fanger output in IDF)
+            # Soft excess-PPD score (not dollars)
             ppd_max = reward_config.get('ppd_acceptable_max', 10.0)
             scale = reward_config.get('ppd_penalty_scale', 0.01)
             comfort_penalty = 0.0
             if self.handles_initialized:
-                exchange = self.api.exchange
-                for _, zhandles in self.handles['zones'].items():
-                    h = zhandles.get('ppd', -1)
-                    if h and h > 0:
-                        ppd = exchange.get_variable_value(self.state, h)
-                        comfort_penalty += max(0.0, ppd - ppd_max) * scale
-            comfort_penalty *= COMFORT_WEIGHT
-            return comfort_penalty
+                for people, ppd in self._zone_people_and_ppd():
+                    if ppd is None:
+                        continue
+                    comfort_penalty += max(0.0, ppd - ppd_max) * scale
+            return comfort_penalty * COMFORT_WEIGHT if apply_static_weight else comfort_penalty
+
         # Temperature-based: penalty when zone temp deviates from base_temp beyond threshold
         COMFORT_THRESHOLD = reward_config['comfort_threshold']
         comfort_penalty = 0.0
@@ -1053,17 +2099,134 @@ class HVACEnvironment:
             deviation = abs(temp - self.base_temp)
             if deviation > COMFORT_THRESHOLD:
                 comfort_penalty += (deviation - COMFORT_THRESHOLD) * 0.5
-        comfort_penalty *= COMFORT_WEIGHT
-        return comfort_penalty
-    
+        return comfort_penalty * COMFORT_WEIGHT if apply_static_weight else comfort_penalty
+
+    def _compute_co2_penalty(self, reward_config, dt_hours=None, apply_static_weight=True):
+        """IAQ penalty: soft ppm threshold or CO2→productivity $ cost.
+
+        productivity model sources (order-of-magnitude):
+          Seppänen, Fisk & Lei (2006) Indoor Air — ventilation & office performance;
+          Wargocki et al. (2000) Indoor Air — outdoor air, SBS, productivity;
+          Wargocki et al. pooled CO2–performance analyses (~%/100 ppm in some fits);
+          Allen et al. (2016) COGfx — cognitive scores vs CO2/ventilation.
+          Default co2_productivity_loss_per_100ppm=0.01 is a tunable proxy.
+
+        For each floor (occupant-weighted floor CO2):
+          loss_frac = clamp((CO2 - co2_ref) / 100 * loss_per_100ppm, 0, max_loss)
+          cost += loss_frac * people_on_floor * wage * dt
+
+        If apply_static_weight is False, return raw cost before co2_weight.
+        """
+        co2_weight = float(reward_config.get('co2_weight', 0.0))
+        if not self.handles_initialized:
+            return 0.0
+        if apply_static_weight and co2_weight <= 0.0:
+            return 0.0
+        if dt_hours is None:
+            dt_hours = 1.0 / self.timesteps_per_hour
+
+        model = reward_config.get('co2_model', 'threshold')
+        exchange = self.api.exchange
+
+        if model == 'productivity':
+            co2_ref = float(reward_config.get('co2_reference_ppm', 800.0))
+            loss_per_100 = float(reward_config.get('co2_productivity_loss_per_100ppm', 0.01))
+            max_loss = float(reward_config.get('co2_max_productivity_loss', 0.15))
+            cost = 0.0
+            for floor in FLOOR_ORDER:
+                co2_values = []
+                people_sum = 0.0
+                for zone_name in FLOOR_ZONE_GROUPS[floor]:
+                    zhandles = self.handles['zones'].get(zone_name)
+                    if not zhandles:
+                        continue
+                    if zhandles.get('co2', -1) > 0:
+                        co2_values.append(exchange.get_variable_value(self.state, zhandles['co2']))
+                    h_people = zhandles.get('people', -1)
+                    if h_people and h_people > 0:
+                        people_sum += float(exchange.get_variable_value(self.state, h_people))
+                if not co2_values or people_sum <= 0.0:
+                    continue
+                floor_co2 = float(np.mean(co2_values))
+                loss_frac = np.clip(
+                    (floor_co2 - co2_ref) / 100.0 * loss_per_100, 0.0, max_loss
+                )
+                cost += self._productivity_cost_from_loss(
+                    loss_frac, people_sum, reward_config, dt_hours
+                )
+            return cost * co2_weight if apply_static_weight else cost
+
+        # Legacy soft threshold score (not dollars)
+        threshold = float(reward_config.get('co2_threshold_ppm', 1000.0))
+        scale = float(reward_config.get('co2_penalty_scale', 0.001))
+        penalty = 0.0
+        for floor in FLOOR_ORDER:
+            co2_values = []
+            for zone_name in FLOOR_ZONE_GROUPS[floor]:
+                zhandles = self.handles['zones'].get(zone_name)
+                if zhandles and zhandles.get('co2', -1) > 0:
+                    co2_values.append(exchange.get_variable_value(self.state, zhandles['co2']))
+            if not co2_values:
+                continue
+            floor_co2 = float(np.mean(co2_values))
+            penalty += max(0.0, floor_co2 - threshold) * scale
+        return penalty * co2_weight if apply_static_weight else penalty
+
+    def _apply_cost_normalization(self, reward_config, components):
+        """Optionally convert absolute $ costs to normalized $/m² for transferability.
+
+        reward.cost_normalization.mode:
+          absolute — leave components as building-total $ for the timestep
+          per_m2   — divide dollar terms by floor_area_m2
+
+        Non-dollar terms (legacy setpoint/demand scores) are left unchanged.
+        """
+        norm = reward_config.get('cost_normalization') or {}
+        mode = str(norm.get('mode', 'absolute')).lower()
+        if mode in ('none', 'absolute', ''):
+            components['cost_normalization_mode'] = 'absolute'
+            components['cost_normalization_factor'] = 1.0
+            return components
+        if mode != 'per_m2':
+            raise ValueError(
+                f"reward.cost_normalization.mode must be 'absolute' or 'per_m2', got {mode!r}"
+            )
+        area = float(norm.get('floor_area_m2', 0.0))
+        if area <= 0.0:
+            raise ValueError(
+                "reward.cost_normalization.floor_area_m2 must be > 0 when mode is 'per_m2'"
+            )
+        factor = 1.0 / area
+        for key in ('energy_cost', 'gas_cost', 'comfort_penalty', 'co2_penalty', 'comfort_raw', 'co2_raw'):
+            if key in components:
+                components[key] = float(components[key]) * factor
+        # Rebuild total from normalized dollar terms + any non-normalized residuals
+        components['total_cost'] = (
+            components['energy_cost']
+            + components['gas_cost']
+            + components['comfort_penalty']
+            + components['setpoint_penalty']
+            + components['demand_penalty']
+            + components['co2_penalty']
+        )
+        components['reward'] = -components['total_cost']
+        components['cost_normalization_mode'] = 'per_m2'
+        components['cost_normalization_factor'] = factor
+        return components
+
     def compute_reward_components(self, reward_config, zone_temps, action):
         """
         Compute reward and all components (energy cost, comfort, setpoint, demand, price used).
         Single place for reward logic; used by calculate_reward and for logging.
         Returns dict with: reward, energy_cost, comfort_penalty, setpoint_penalty, demand_penalty,
-        total_cost, energy_price_used, energy_kwh, current_power.
+        co2_penalty, total_cost, energy_price_used, energy_kwh, current_power.
+
+        Thermal (ppd_productivity) and IAQ (co2_model=productivity) use literature-based
+        order-of-magnitude productivity translations; see config reward comments for sources
+        (ASHRAE 55; Kosonen & Tan; Lan/Wargocki/Lian 2011; Seppänen/Fisk ventilation &
+        temperature-performance work; Wargocki et al. 2000; Allen et al. COGfx).
+        Optional cost_normalization.mode=per_m2 converts $ → $/m².
         """
-        ENERGY_WEIGHT = reward_config['energy_weight']
         SETPOINT_WEIGHT = reward_config['setpoint_weight']
         DEMAND_WEIGHT = reward_config['demand_weight']
         DEMAND_THRESHOLD = reward_config['demand_threshold']
@@ -1085,16 +2248,29 @@ class HVACEnvironment:
                 "Check callback_after_predictor_after_hvac_managers registration."
             )
         energy_kwh = (current_power / 1000.0) * dt_hours
-        energy_cost = energy_kwh * energy_price_used * ENERGY_WEIGHT
+        energy_cost = energy_kwh * energy_price_used  # $ = kWh × RTP
 
-        GAS_WEIGHT = reward_config.get('gas_weight', 0.3)
         GAS_PRICE = reward_config.get('gas_price_per_kwh', 0.017)
         gas_j = self.api.exchange.get_meter_value(self.state, self.handles['gas_meter'])
         gas_kwh = gas_j / 3_600_000.0
         current_gas_power = (gas_kwh / dt_hours) * 1000.0
-        gas_cost = gas_kwh * GAS_PRICE * GAS_WEIGHT
+        gas_cost = gas_kwh * GAS_PRICE  # $ = kWh × gas price
         
-        comfort_penalty = self._compute_comfort_penalty(reward_config, zone_temps)
+        # Raw productivity $ (before static + adaptive weights) for online balancing
+        comfort_raw = self._compute_comfort_penalty(
+            reward_config, zone_temps, dt_hours=dt_hours, apply_static_weight=False
+        )
+        co2_raw = self._compute_co2_penalty(
+            reward_config, dt_hours=dt_hours, apply_static_weight=False
+        )
+        energy_ref = energy_cost + gas_cost
+        adaptive = self.adaptive_cost_balancer.update_and_get_scales(
+            energy_ref, comfort_raw, co2_raw
+        )
+        comfort_weight = float(reward_config['comfort_weight'])
+        co2_weight = float(reward_config.get('co2_weight', 0.0))
+        comfort_penalty = comfort_raw * comfort_weight * float(adaptive['comfort'])
+        co2_penalty = co2_raw * co2_weight * float(adaptive['co2'])
         
         action_bounds = self.hvac_config.get_action_bounds()
         def _scale(a, lo, hi):
@@ -1110,20 +2286,33 @@ class HVACEnvironment:
         
         demand_penalty = 0.0
         current_power_kw = current_power / 1000.0  # convert W -> kW; DEMAND_THRESHOLD is in kW
-        if current_power_kw > DEMAND_THRESHOLD:
+        if DEMAND_WEIGHT > 0.0 and current_power_kw > DEMAND_THRESHOLD:
             demand_penalty = (current_power_kw - DEMAND_THRESHOLD) * 0.2
         demand_penalty *= DEMAND_WEIGHT
         
-        total_cost = energy_cost + gas_cost + comfort_penalty + setpoint_penalty + demand_penalty
+        total_cost = (
+            energy_cost + gas_cost + comfort_penalty + setpoint_penalty
+            + demand_penalty + co2_penalty
+        )
         reward = -total_cost
 
-        return {
+        components = {
             'reward': reward,
             'energy_cost': energy_cost,
             'gas_cost': gas_cost,
             'comfort_penalty': comfort_penalty,
             'setpoint_penalty': setpoint_penalty,
             'demand_penalty': demand_penalty,
+            'co2_penalty': co2_penalty,
+            'comfort_raw': comfort_raw,
+            'co2_raw': co2_raw,
+            'adaptive_comfort_scale': float(adaptive['comfort']),
+            'adaptive_co2_scale': float(adaptive['co2']),
+            'adaptive_balancing_active': bool(adaptive['active']),
+            'adaptive_ema_energy': adaptive['ema_energy'],
+            'adaptive_ema_comfort': adaptive['ema_comfort'],
+            'adaptive_ema_co2': adaptive['ema_co2'],
+            'adaptive_n_samples': int(adaptive['n_samples']),
             'total_cost': total_cost,
             'energy_price_used': energy_price_used,
             'energy_kwh': energy_kwh,
@@ -1131,12 +2320,22 @@ class HVACEnvironment:
             'gas_kwh': gas_kwh,
             'current_gas_power': current_gas_power,
         }
+        return self._apply_cost_normalization(reward_config, components)
     
     def calculate_reward(self, action, curr_state):
         """Calculate reward based on energy efficiency and thermal comfort (uses compute_reward_components)."""
         reward_config = self.hvac_config.config['reward']
-        zone_temps = curr_state[:5]
+        # Prefer all controlled zone temps for comfort; fall back to observation features
+        if self.handles_initialized and self.handles.get('zones'):
+            zone_temps = [
+                self._zone_temp_value(zone_name)
+                for zone_name in self.handles['zones']
+            ]
+        else:
+            zone_count = self.hvac_config.config['state_space']['zone_temps']['count']
+            zone_temps = list(curr_state[:zone_count])
         components = self.compute_reward_components(reward_config, zone_temps, action)
+        self._last_reward_components = components
         return components['reward']
     
     def step(self, action):
@@ -1154,6 +2353,7 @@ class HVACEnvironment:
             reward = self.calculate_reward(action, self.current_state)
         else:
             reward = 0.0
+            self._last_reward_components = None
         
         # Update tracking
         self.episode_reward += reward
@@ -1182,12 +2382,14 @@ class RLHVACController:
     """Controller that uses RL agent for HVAC control."""
     
     def __init__(self, api, state, config_path=None, training_mode=False, live_plotter=None, loss_plotter=None,
-                 output_dir=None, model_path=None, save_model=False, save_every=20):
+                 episode_kpi_plotter=None, output_dir=None, model_path=None, save_model=False, save_every=20,
+                 simulation_overrides=None):
         self.api = api
         self.state = state
         self.training_mode = training_mode
         self.live_plotter = live_plotter
         self.loss_plotter = loss_plotter
+        self.episode_kpi_plotter = episode_kpi_plotter
         self.output_dir = output_dir
 
         # Checkpointing: save_model gates both the final save and periodic
@@ -1196,7 +2398,7 @@ class RLHVACController:
         self.save_every = save_every
 
         # Initialize environment
-        self.env = HVACEnvironment(api, state, config_path)
+        self.env = HVACEnvironment(api, state, config_path, simulation_overrides=simulation_overrides)
 
         # Initialize RL agent
         sac_config_path = project_root / "sac_config" / "sac_config.yaml"
@@ -1231,6 +2433,32 @@ class RLHVACController:
                 loaded_episode_count = extra_state.get('episode_count', 0)
                 print(f"Loaded pre-trained model from {load_path}"
                       + (f" (resuming at episode {loaded_episode_count})" if loaded_episode_count else ""))
+                bal = getattr(self.env, 'adaptive_cost_balancer', None)
+                if bal is not None and bal.load_state_dict(extra_state.get('adaptive_balancer')):
+                    print(
+                        "Adaptive balancer restored: "
+                        f"n_samples={bal.n_samples}  "
+                        f"ppd_scale={bal.comfort_scale:.4f}  "
+                        f"co2_scale={bal.co2_scale:.4f}  "
+                        f"active={bal.n_samples >= bal.min_samples}"
+                    )
+                elif training_mode and bal is not None and bal.enabled:
+                    print(
+                        "No adaptive balancer state in checkpoint — "
+                        "scales restart at initial_scale until min_samples."
+                    )
+                if training_mode:
+                    mem = len(self.agent.memory)
+                    if mem >= self.training_start_memory:
+                        print(
+                            f"Replay buffer restored ({mem} transitions) — "
+                            "training updates will start on the first new step."
+                        )
+                    else:
+                        print(
+                            f"Replay buffer has {mem}/{self.training_start_memory} transitions — "
+                            "collecting more before training updates resume."
+                        )
             else:
                 print(f"No pre-trained model found at {load_path}, using untrained agent")
 
@@ -1297,6 +2525,7 @@ class RLHVACController:
             return
         self.env.apply_outdoor_co2_for_current_timestep()
         self.env.apply_weather_override()
+        self.env.apply_occupancy_events_for_current_timestep()
 
     def timestep_callback(self, state):
         """Called at each EnergyPlus timestep."""
@@ -1367,15 +2596,20 @@ class RLHVACController:
         
         # Reward components from single source (same as env.calculate_reward); includes real-time price
         reward_config = self.env.hvac_config.config['reward']
-        zone_count_for_reward = self.env.hvac_config.config['state_space']['zone_temps']['count']
+        # Zone temps for logging / display (and fallback reward recompute)
         raw_zone_temps = []
-        for zone_name, zhandles in list(self.env.handles['zones'].items())[:zone_count_for_reward]:
+        for zone_name, zhandles in self.env.handles['zones'].items():
             h_temp = zhandles.get('temp', -1)
             if h_temp and h_temp > 0:
                 raw_zone_temps.append(self.api.exchange.get_variable_value(self.state, h_temp))
         if not raw_zone_temps:
-            raw_zone_temps = current_state[:zone_count_for_reward]
-        components = self.env.compute_reward_components(reward_config, raw_zone_temps, action)
+            zone_count_for_reward = self.env.hvac_config.config['state_space']['zone_temps']['count']
+            raw_zone_temps = list(current_state[:zone_count_for_reward])
+        # Prefer components already computed in env.step (avoids double-updating adaptive EMA)
+        if self.env._last_reward_components is not None:
+            components = self.env._last_reward_components
+        else:
+            components = self.env.compute_reward_components(reward_config, raw_zone_temps, action)
         reward = components['reward']
         self.env.episode_reward += reward - env_step_reward
         energy_cost = components['energy_cost']
@@ -1383,12 +2617,18 @@ class RLHVACController:
         comfort_penalty = components['comfort_penalty']
         setpoint_penalty = components['setpoint_penalty']
         demand_penalty = components['demand_penalty']
+        co2_penalty = components['co2_penalty']
         total_cost = components['total_cost']
         current_power = components['current_power']
         energy_price_used = components['energy_price_used']
         energy_kwh = components['energy_kwh']
         gas_kwh = components['gas_kwh']
         current_gas_power = components['current_gas_power']
+        cost_norm_mode = components.get('cost_normalization_mode', 'absolute')
+        adaptive_comfort_scale = components.get('adaptive_comfort_scale', 1.0)
+        adaptive_co2_scale = components.get('adaptive_co2_scale', 1.0)
+        adaptive_balancing_active = components.get('adaptive_balancing_active', False)
+        adaptive_n_samples = components.get('adaptive_n_samples', 0)
         
         # Store experience if training
         if self.training_mode:
@@ -1426,8 +2666,10 @@ class RLHVACController:
 
         sp_offset = _scale(action[0], action_bounds['sp_offset'][0], action_bounds['sp_offset'][1])
         deadband = _scale(action[1], action_bounds['deadband'][0], action_bounds['deadband'][1])
-        airflow_mult = _scale(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1])
-        airflow_actual = self.env.min_airflow + (self.env.max_airflow - self.env.min_airflow) * airflow_mult
+        oa_mass_flow = max(
+            0.0,
+            _scale(action[2], action_bounds['airflow_multiplier'][0], action_bounds['airflow_multiplier'][1]),
+        )
         htg_sp = self.env.base_temp + sp_offset - deadband / 2
         clg_sp = self.env.base_temp + sp_offset + deadband / 2
         outdoor_co2 = self.env.get_outdoor_co2_ppm(current_month, current_day, current_hour)
@@ -1471,6 +2713,15 @@ class RLHVACController:
                 zone_pmv[f'pmv_{zone_name}'] = exchange.get_variable_value(self.state, h_pmv)
             else:
                 zone_pmv[f'pmv_{zone_name}'] = np.nan
+
+        ahu_oa_flows = {}
+        for floor, handles in self.env.handles.get('ahu_oa', {}).items():
+            h_oa = handles.get('mass_flow', -1)
+            if h_oa and h_oa > 0:
+                ahu_oa_flows[floor] = exchange.get_variable_value(self.state, h_oa)
+            else:
+                ahu_oa_flows[floor] = np.nan
+        valid_ahu_oa_flows = [v for v in ahu_oa_flows.values() if not np.isnan(v)]
         
         # One-time diagnostic: CO2 often stays 400 ppm during unoccupied hours (outdoor default)
         if not self._co2_400_warned and zone_co2:
@@ -1484,6 +2735,7 @@ class RLHVACController:
         log_entry = {
             'episode': episode_no,
             'timestep': self.env.timestep_count,
+            'elapsed_hours': self.env.timestep_count / self.env.timesteps_per_hour,
             'action': action.tolist(),
             'reward': reward,
             'energy_cost': energy_cost,
@@ -1491,7 +2743,17 @@ class RLHVACController:
             'comfort_penalty': comfort_penalty,
             'setpoint_penalty': setpoint_penalty,
             'demand_penalty': demand_penalty,
+            'co2_penalty': co2_penalty,
             'total_cost': total_cost,
+            'cost_normalization_mode': cost_norm_mode,
+            'cost_normalization_factor': components.get('cost_normalization_factor', 1.0),
+            'adaptive_comfort_scale': adaptive_comfort_scale,
+            'adaptive_co2_scale': adaptive_co2_scale,
+            'adaptive_balancing_active': adaptive_balancing_active,
+            'adaptive_n_samples': adaptive_n_samples,
+            'adaptive_ema_energy': components.get('adaptive_ema_energy'),
+            'adaptive_ema_comfort': components.get('adaptive_ema_comfort'),
+            'adaptive_ema_co2': components.get('adaptive_ema_co2'),
             'energy_price_used': energy_price_used,
             'energy_kwh': energy_kwh,
             'current_power': current_power,
@@ -1504,10 +2766,11 @@ class RLHVACController:
             'cooling_setpoint': clg_sp,
             'setpoint_offset': sp_offset,
             'deadband': deadband,
-            'airflow': airflow_actual,
-            'bottom_floor_airflow': airflow_actual,
-            'mid_floor_airflow': airflow_actual,
-            'top_floor_airflow': airflow_actual,
+            'commanded_oa_mass_flow': oa_mass_flow,
+            'airflow': float(np.mean(valid_ahu_oa_flows)) if valid_ahu_oa_flows else np.nan,
+            'bottom_floor_airflow': ahu_oa_flows.get('bottom', np.nan),
+            'mid_floor_airflow': ahu_oa_flows.get('mid', np.nan),
+            'top_floor_airflow': ahu_oa_flows.get('top', np.nan),
             'episode_reward': self.env.episode_reward,
             'hour': current_hour,
             'day': current_day,
@@ -1522,6 +2785,10 @@ class RLHVACController:
         self.log_data.append(log_entry)
         if self.live_plotter is not None:
             self.live_plotter.update(log_entry)
+        if self.loss_plotter is not None:
+            self.loss_plotter.update_weights(log_entry)
+        if self.episode_kpi_plotter is not None:
+            self.episode_kpi_plotter.update_step(log_entry)
         
         # Print progress (use step-within-episode for display; variable-length episodes)
         timestep_minutes = 60 // self.env.timesteps_per_hour
@@ -1542,8 +2809,9 @@ class RLHVACController:
     
         
         # Same [-1,1] -> bounds scaling as apply_action (for display)
-        # States: zone temps (first 5), then outdoor temp
+        # States: print observation temp features (aggregated or per-zone)
         zone_count = self.env.hvac_config.config['state_space']['zone_temps']['count']
+        zone_temp_mode = self.env.hvac_config.config['state_space']['zone_temps'].get('mode', 'zones')
         zone_temps = current_state[:zone_count]
         if len(current_state) <= zone_count:
             raise RuntimeError(
@@ -1551,17 +2819,41 @@ class RLHVACController:
                 f"state length is {len(current_state)}"
             )
         outdoor_temp = current_state[zone_count]
-        display_zone_temps = raw_zone_temps[:zone_count]
-        zone_str = ", ".join([f"{t:5.1f}" for t in display_zone_temps])
+        if zone_temp_mode == 'perimeter_core':
+            display_temps = []
+            for floor in FLOOR_ORDER:
+                display_temps.append(self.env._zone_temp_value(CORE_ZONE_BY_FLOOR[floor]))
+            for floor in FLOOR_ORDER:
+                perim = [self.env._zone_temp_value(z) for z in PERIMETER_ZONE_GROUPS[floor]]
+                display_temps.append(float(np.mean(perim)))
+            labels = PERIMETER_CORE_TEMP_COLUMNS
+            zone_str = ", ".join(
+                [f"{labels[i]}={display_temps[i]:5.1f}" for i in range(len(display_temps))]
+            )
+        elif zone_temp_mode == 'floor':
+            display_temps = []
+            for floor in FLOOR_ORDER:
+                floor_temps = [self.env._zone_temp_value(z) for z in FLOOR_ZONE_GROUPS[floor]]
+                display_temps.append(float(np.mean(floor_temps)))
+            zone_str = ", ".join(
+                [f"{FLOOR_TEMP_COLUMNS[i]}={display_temps[i]:5.1f}" for i in range(len(display_temps))]
+            )
+        else:
+            display_zone_temps = raw_zone_temps[:zone_count]
+            zone_str = ", ".join([f"{t:5.1f}" for t in display_zone_temps])
         memory_len = len(self.agent.memory)
         memory_status = f"{memory_len}/{self.training_start_memory}" if self.training_mode else str(memory_len)
         
         # Print: time, step; actual actions (raw + scaled); states; reward; then blank line
         print(f"{datetime_str} | Ep {episode_no:3d} | Step {episode_step:3d}")
         action_items = [
-            f"raw_sp={action[0]:+.2f}", f"raw_db={action[1]:+.2f}", f"raw_af={action[2]:+.2f}",
+            f"raw_sp={action[0]:+.2f}", f"raw_db={action[1]:+.2f}", f"raw_oa={action[2]:+.2f}",
             f"sp_offset={sp_offset:+.2f}°C", f"htg_sp={htg_sp:.1f}°C",
-            f"clg_sp={clg_sp:.1f}°C", f"deadband={deadband:.2f}°C", f"airflow={airflow_actual:.4f}m³/s",
+            f"clg_sp={clg_sp:.1f}°C", f"deadband={deadband:.2f}°C",
+            f"oa_cmd={oa_mass_flow:.3f}kg/s",
+            f"oa_flow_bot={ahu_oa_flows.get('bottom', np.nan):.3f}kg/s",
+            f"oa_flow_mid={ahu_oa_flows.get('mid', np.nan):.3f}kg/s",
+            f"oa_flow_top={ahu_oa_flows.get('top', np.nan):.3f}kg/s",
         ]
         print("   Actions:")
         for i in range(0, len(action_items), 5):
@@ -1571,7 +2863,7 @@ class RLHVACController:
         for i in range(0, len(current_state), 10):
             chunk = current_state[i:i+10]
             print("     " + "  ".join([f"[{i+j:2d}]{v:+.3f}" for j, v in enumerate(chunk)]))
-        print(f"   Reward: {reward:7.3f}  episode_total={self.env.episode_reward:7.3f}  |  elec_cost[$]={energy_cost:.4f}  gas_cost[$]={gas_cost:.4f}  comfort={comfort_penalty:.4f}  setpoint={setpoint_penalty:.4f}  demand_penalty[$]={demand_penalty:.4f}  total_cost={total_cost:.4f}  |  price[$/kWh]={energy_price_used:.3f}  elec[kWh]={energy_kwh:.4f}  elec[kW]={current_power/1000:.2f}  gas[kWh]={gas_kwh:.4f}  gas[kW]={current_gas_power/1000:.2f}")
+        print(f"   Reward: {reward:7.3f}  episode_total={self.env.episode_reward:7.3f}  |  elec_cost[$]={energy_cost:.4f}  gas_cost[$]={gas_cost:.4f}  comfort={comfort_penalty:.4f}  setpoint={setpoint_penalty:.4f}  demand_penalty[$]={demand_penalty:.4f}  co2={co2_penalty:.4f}  total_cost={total_cost:.4f}  |  price[$/kWh]={energy_price_used:.3f}  elec[kWh]={energy_kwh:.4f}  elec[kW]={current_power/1000:.2f}  gas[kWh]={gas_kwh:.4f}  gas[kW]={current_gas_power/1000:.2f}")
         print()
         
         # Reset if episode done: sample next random start (after current time) and duration
@@ -1580,6 +2872,8 @@ class RLHVACController:
             dur_h = getattr(self, '_current_episode_duration_hours', None)
             dur_str = f" (duration: {dur_h:.1f} h)" if dur_h is not None else ""
             print(f"\n--- Episode {self.episode_count} completed{dur_str} ---\n")
+            if self.episode_kpi_plotter is not None:
+                self.episode_kpi_plotter.finalize_episode(self.episode_count)
 
             # Periodic checkpoint every `save_every` episodes during training
             if (self.training_mode and self.save_model_enabled and self.save_every > 0
@@ -1631,9 +2925,12 @@ RL HVAC Control Summary:
         return summary
     
     def save_model(self, path):
-        """Save trained RL model, including episode_count so a resumed run/plots can
-        continue numbering from where this checkpoint left off."""
-        self.agent.save(path, extra_state={'episode_count': self.episode_count})
+        """Save trained RL model, including episode_count and adaptive balancer state."""
+        bal = getattr(self.env, 'adaptive_cost_balancer', None)
+        extra = {'episode_count': self.episode_count}
+        if bal is not None and bal.enabled:
+            extra['adaptive_balancer'] = bal.state_dict()
+        self.agent.save(path, extra_state=extra)
         print(f"Model saved to {path}")
     
     def save_log_to_csv(self, filepath):
@@ -1657,12 +2954,15 @@ def run_simulation(
     override_test=False,
     live_plot=False,
     loss_plot=False,
+    adaptive_weight_plot=False,
+    episode_kpi_plot=False,
     live_plot_every=1,
     live_plot_hold=False,
     live_plot_scope="current",
     model_path=None,
     save_model=False,
     save_every=20,
+    simulation_overrides=None,
 ):
     """Run EnergyPlus simulation with RL HVAC control.
     
@@ -1673,6 +2973,11 @@ def run_simulation(
     [episode_duration_hours min, max].
     """
     hvac_config = get_hvac_config(config)
+    if simulation_overrides:
+        sim_override_cfg = hvac_config.config.setdefault('simulation', {})
+        for key, value in simulation_overrides.items():
+            if value is not None:
+                sim_override_cfg[key] = value
     sim_cfg = hvac_config.config['simulation']
     window = sim_cfg.get('training_window', {})
     start_month = window.get('start_month', sim_cfg.get('start_month', 6))
@@ -1708,11 +3013,13 @@ def run_simulation(
         outdoor_co2 = sim_cfg.get('outdoor_co2_ppm')
         outdoor_co2_csv = sim_cfg.get('outdoor_co2_csv_path')
         outdoor_co2_fallback = sim_cfg.get('outdoor_co2_fallback_ppm')
+        occupancy_schedule_name = hvac_config.config.get('occupancy_events', {}).get('schedule_name')
         idf_path = create_custom_idf(
             idf_path, start_month, start_day, end_month, end_day, output_dir,
             outdoor_co2_ppm=outdoor_co2,
             outdoor_co2_csv_path=outdoor_co2_csv,
             outdoor_co2_fallback_ppm=outdoor_co2_fallback,
+            occupancy_schedule_name=occupancy_schedule_name,
         )
     
     live_plotter = None
@@ -1727,15 +3034,42 @@ def run_simulation(
             f"Live plot enabled (updates every {max(1, int(live_plot_every))} "
             f"timestep(s), scope: {live_plot_scope})"
         )
-    if loss_plot:
-        if training_mode:
-            loss_plotter = LiveLossPlotter(
-                output_dir=output_dir,
-                update_every=live_plot_every,
+
+    show_losses = bool(loss_plot and training_mode)
+    show_weights = bool(adaptive_weight_plot)
+    if loss_plot and not training_mode:
+        print("Warning: --loss-plot requested without --training; SAC loss panels will be omitted")
+    if adaptive_weight_plot:
+        ab = (hvac_config.config.get("reward") or {}).get("adaptive_balancing") or {}
+        if not ab.get("enabled", False):
+            print(
+                "Warning: --adaptive-weight-plot set but reward.adaptive_balancing.enabled "
+                "is false; scales will stay at 1.0"
             )
-            print("SAC loss live plot enabled")
-        else:
-            print("Warning: --loss-plot requested without --training; no SAC losses will be plotted")
+    if show_losses or show_weights:
+        loss_plotter = LiveLossPlotter(
+            output_dir=output_dir,
+            update_every=live_plot_every,
+            show_losses=show_losses,
+            show_adaptive_weights=show_weights,
+        )
+        parts = []
+        if show_losses:
+            parts.append("SAC losses")
+        if show_weights:
+            parts.append("adaptive PPD/CO₂ weights")
+        print("Training plot enabled (" + " + ".join(parts) + ")")
+
+    episode_kpi_plotter = None
+    if episode_kpi_plot:
+        reward_cfg = hvac_config.config.get("reward") or {}
+        norm = reward_cfg.get("cost_normalization") or {}
+        area = norm.get("floor_area_m2")
+        episode_kpi_plotter = LiveEpisodeDollarKPIPlotter(
+            output_dir=output_dir,
+            floor_area_m2=area,
+        )
+        print("Episode dollar KPI plot enabled (absolute $ per episode)")
 
     api = EnergyPlusAPI()
     state = api.state_manager.new_state()
@@ -1746,10 +3080,12 @@ def run_simulation(
         training_mode=training_mode,
         live_plotter=live_plotter,
         loss_plotter=loss_plotter,
+        episode_kpi_plotter=episode_kpi_plotter,
         output_dir=output_dir,
         model_path=model_path,
         save_model=save_model,
         save_every=save_every,
+        simulation_overrides=simulation_overrides,
     )
     controller.max_episodes = max_episodes
 
@@ -1788,14 +3124,20 @@ def run_simulation(
     ss = cfg['state_space']
     zone_names = list(controller.env.handles['zones'].keys()) if controller.env.handles_initialized else CONTROLLED_ZONE_NAMES
     zone_count = ss['zone_temps']['count']
+    zone_temp_mode = ss['zone_temps'].get('mode', 'zones')
     wf = controller.env.hvac_config.weather_forecast_offsets
     weather_history_cfg = ss.get('weather_history', {})
     past_horizon = weather_history_cfg.get('horizon', 0) if weather_history_cfg.get('enabled', False) else 0
-    co2_count = ss.get('zone_co2_ppm', {}).get('count', zone_count)
+    floor_co2_count = ss.get('floor_co2_ppm', {}).get('count', 0)
 
     state_columns = []
-    for z in zone_names[:zone_count]:
-        state_columns.append(f"zone_temp_{z}")
+    if zone_temp_mode == 'perimeter_core':
+        state_columns += [f"zone_temp_{name}" for name in PERIMETER_CORE_TEMP_COLUMNS[:zone_count]]
+    elif zone_temp_mode == 'floor':
+        state_columns += [f"zone_temp_{name}" for name in FLOOR_TEMP_COLUMNS[:zone_count]]
+    else:
+        for z in zone_names[:zone_count]:
+            state_columns.append(f"zone_temp_{z}")
     state_columns += ["oat", "humidity", "sky_temp"]
     for field, label in (('oat', 'oat'), ('humidity', 'humidity'), ('cloud_cover', 'sky_temp')):
         for t in wf[field]:
@@ -1803,22 +3145,27 @@ def run_simulation(
     for t in range(1, past_horizon + 1):
         state_columns += [f"past_t{t}_oat", f"past_t{t}_humidity", f"past_t{t}_sky_temp"]
     state_columns += ["hour_of_day", "day_of_week", "month_of_year"]
-    state_columns += ["prev_sp_offset", "prev_deadband", "prev_airflow"]
+    prev_count = ss.get('previous_actions', {}).get('count', 0)
+    previous_action_columns = ["prev_sp_offset", "prev_deadband", "prev_airflow"]
+    state_columns += previous_action_columns[:prev_count]
     state_columns += ["outdoor_co2"]
-    for z in zone_names[:co2_count]:
-        state_columns.append(f"zone_co2_{z}")
+    for floor in FLOOR_ORDER[:floor_co2_count]:
+        state_columns.append(f"floor_co2_{floor}")
+    rtp_count = ss.get('rtp_price', {}).get('count', 0)
+    rtp_columns = ["rtp_price_current", "rtp_price_hour_ahead"]
+    state_columns += rtp_columns[:rtp_count]
 
     print("\n" + "=" * 60)
     print("RL HVAC Control Configuration")
     print("=" * 60)
     print(f"  Timesteps per hour: {controller.env.timesteps_per_hour}")
     print(f"  Training mode:      {controller.training_mode}")
-    print(f"  Action size:        {controller.env.action_size}  [sp_offset, deadband, airflow_multiplier]")
+    print(f"  Action size:        {controller.env.action_size}  [sp_offset, deadband, oa_mass_flow]")
     action_cfg = cfg['action_space']
     action_columns = [
         ("sp_offset",          action_cfg['sp_offset']['min'],          action_cfg['sp_offset']['max'],          "°C"),
         ("deadband",           action_cfg['deadband']['min'],           action_cfg['deadband']['max'],           "°C"),
-        ("airflow_multiplier", action_cfg['airflow_multiplier']['min'], action_cfg['airflow_multiplier']['max'], "x"),
+        ("oa_mass_flow", action_cfg['airflow_multiplier']['min'], action_cfg['airflow_multiplier']['max'], "kg/s"),
     ]
 
     print(f"  Action vector columns [{len(action_columns)}]:")
@@ -1859,6 +3206,8 @@ def run_simulation(
             live_plotter.finish(output_dir, hold=live_plot_hold)
         if loss_plotter is not None:
             loss_plotter.finish(output_dir, hold=live_plot_hold)
+        if episode_kpi_plotter is not None:
+            episode_kpi_plotter.finish(output_dir, hold=live_plot_hold)
     
     api.state_manager.delete_state(state)
     
@@ -1910,12 +3259,22 @@ def main():
                         help='Show a live matplotlib plot while the RL simulation is running')
     parser.add_argument('--loss-plot', action='store_true',
                         help='Show a separate live plot of SAC training losses; only active with --training')
+    parser.add_argument('--adaptive-weight-plot', action='store_true',
+                        help='Add adaptive PPD/CO2 productivity scales (and cost EMAs) to the '
+                             'SAC loss plot window; creates that window if --loss-plot is not set')
+    parser.add_argument('--episode-kpi-plot', action='store_true',
+                        help='Show a live chart of absolute dollar KPIs (electric, gas, thermal, '
+                             'IAQ, total) summed per completed episode')
     parser.add_argument('--live-plot-every', type=int, default=1,
                         help='Refresh the live plot every N logged timesteps (default: 1)')
     parser.add_argument('--live-plot-hold', action='store_true',
                         help='Keep the live plot window open after the simulation finishes')
     parser.add_argument('--live-plot-scope', choices=['current', 'all'], default='current',
                         help='Live plot scope: current resets at each episode; all overlays all episodes on one continuous timeline')
+    parser.add_argument('--outdoor-co2-csv', type=str, default=None,
+                        help='Path to outdoor CO2 CSV (overrides simulation.outdoor_co2_csv_path in config)')
+    parser.add_argument('--outdoor-co2-fallback', type=float, default=None,
+                        help='Fallback ppm for missing CSV hours (overrides simulation.outdoor_co2_fallback_ppm)')
     
     args = parser.parse_args()
     
@@ -1941,6 +3300,19 @@ def main():
     if not os.path.exists(args.epw):
         print(f"Error: Weather file not found: {args.epw}")
         return 1
+
+    simulation_overrides = {}
+    if args.outdoor_co2_csv:
+        co2_csv = args.outdoor_co2_csv
+        if not os.path.isabs(co2_csv):
+            co2_csv = str(project_root / co2_csv)
+        if not os.path.exists(co2_csv):
+            print(f"Error: Outdoor CO2 CSV not found: {co2_csv}")
+            return 1
+        simulation_overrides['outdoor_co2_csv_path'] = co2_csv
+        print(f"Using outdoor CO2 CSV: {co2_csv}")
+    if args.outdoor_co2_fallback is not None:
+        simulation_overrides['outdoor_co2_fallback_ppm'] = args.outdoor_co2_fallback
     
     # Run simulation: max_episodes from --episodes; --training enables storing transitions (memory grows)
     return run_simulation(
@@ -1950,12 +3322,15 @@ def main():
         override_test=args.override_test,
         live_plot=args.live_plot,
         loss_plot=args.loss_plot,
+        adaptive_weight_plot=args.adaptive_weight_plot,
+        episode_kpi_plot=args.episode_kpi_plot,
         live_plot_every=args.live_plot_every,
         live_plot_hold=args.live_plot_hold,
         live_plot_scope=args.live_plot_scope,
         model_path=args.model,
         save_model=args.save_model,
         save_every=args.save_every,
+        simulation_overrides=simulation_overrides or None,
     )
 
 

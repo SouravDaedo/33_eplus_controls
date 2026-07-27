@@ -16,7 +16,11 @@ Main configuration file defining:
 - **State Space**: Zone temps, weather, forecast, time features, previous actions
 - **Action Space**: Heating offset, deadband, airflow multiplier bounds
 - **Control**: Base temperature, airflow limits
-- **Reward**: Weights for energy, comfort, setpoint penalties
+- **Reward**: Dollar energy (RTP) + PPD/CO₂ productivity costs; optional `$/m²` normalization;
+  optional **`adaptive_balancing`** scales PPD/CO₂ online from training EMAs.
+  See **Reward function (energy + productivity costs)** in [`README.md`](README.md) for
+  literature mapping, the **scale discussion**, and adaptive balancing.
+  formulas and literature sources (what each paper says vs how it is used).
 - **Zones**: Zone names and groupings
 
 ### 2. `src/utils/hvac_config.py`

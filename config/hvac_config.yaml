@@ -39,9 +39,13 @@ weather_files:
 # State Space Configuration
 state_space:
   # Zone temperatures
+  # mode: "zones"          — one feature per zone (count must be 15)
+  # mode: "perimeter_core" — core_bottom/mid/top + avg perimeter temp per floor (count must be 6)
+  # mode: "floor"          — average temp of all zones on each floor: bottom, mid, top (count must be 3)
   zone_temps:
-    count: 5
-    description: "Zone air temperatures (°C)"
+    mode: "floor"
+    count: 3
+    description: "Average zone air temperature (°C) per floor: bottom, mid, top"
   
   # Current weather conditions
   current_weather:
@@ -57,9 +61,9 @@ state_space:
   # buffer). Each variable specifies its own list of timesteps-ahead to forecast —
   # they don't need to match (e.g. look further ahead on temperature than humidity).
   weather_forecast:
-    outdoor_air_temperature: [1, 3, 5]
-    relative_humidity: [1]
-    cloud_cover: [1, 3]
+    outdoor_air_temperature: [4, 8, 12]
+    relative_humidity: [4, 8, 12]
+    cloud_cover: [4, 8, 12]
     description: "Per-variable forecast offsets (zone timesteps ahead), EPW look-ahead"
     # Forecast error: Gaussian noise added to each forecast value so the agent sees
     # realistic forecast uncertainty instead of perfect foresight. Std grows linearly
@@ -90,17 +94,22 @@ state_space:
   
   # Previous actions
   previous_actions:
-    count: 3
-    initial_value: [0.0, 1.0, 0.5]
-    description: "Previous heating offset, deadband, airflow multiplier"
+    count: 0
+    initial_value: []
+    description: "Previous actions excluded from state"
   
   # CO2 (ppm) – outdoor and zone concentrations
   outdoor_co2_ppm:
     count: 1
     description: "Outdoor air CO2 concentration (ppm)"
-  zone_co2_ppm:
-    count: 5
-    description: "Zone air CO2 concentration (ppm) for controlled zones; same order as zone_temps"
+  floor_co2_ppm:
+    count: 3
+    description: "Average zone return air CO2 concentration (ppm) per floor: bottom, mid, top"
+
+  # Electricity RTP ($/kWh) observed by the agent: current hour + hour-ahead published price
+  rtp_price:
+    count: 2
+    description: "Current and 1-hour-ahead electricity RTP ($/kWh)"
 
 # Action Space Configuration
 action_space:
@@ -116,42 +125,143 @@ action_space:
     max: 10.0
     description: "Temperature deadband (°C)"
   
-  # Airflow multiplier
+  # AHU outdoor-air controller mass flow command (keeps legacy key name for action compatibility)
   airflow_multiplier:
-    min: 0.1
-    max: 2.0
-    description: "Outdoor air flow multiplier (0.1-2.0)"
+    min: 0.0
+    max: 6.0
+    description: "AHU outdoor-air controller mass flow command (kg/s); economizer-scale range"
 
 # Control Parameters
 control:
   base_temperature: 22.0  # Base temperature for setpoints (°C)
-  min_airflow: 0.01      # Minimum airflow (m³/s)
-  max_airflow: 0.1       # Maximum airflow (m³/s)
+  min_airflow: 0.01      # Legacy infiltration airflow setting; not used by RL AHU OA controller action
+  max_airflow: 0.1       # Legacy infiltration airflow setting; not used by RL AHU OA controller action
 
 # Reward Function Weights
+# Prefer dollar-denominated terms so energy, thermal, and IAQ are comparable and
+# more transferable across buildings (people×wage×time, optionally /m²).
+#
+# --- Sources for productivity translations (order-of-magnitude engineering models) ---
+# Thermal / PPD → productivity:
+#   - ASHRAE Standard 55: ~10% PPD as a typical design comfort criterion.
+#   - Kosonen, R., & Tan, F. (2004). Assessment of productivity loss in air-conditioned
+#     buildings using PMV/PPD. Building and Environment / related HVAC productivity work
+#     linking thermal dissatisfaction to work performance.
+#   - Lan, L., Wargocki, P., & Lian, Z. (2011). Quantitative measurement of productivity
+#     loss due to thermal discomfort. Energy and Buildings, 43, 1057–1062.
+#   - Seppänen, O., Fisk, W.J., & Lei, Q.H. (2006). Effect of temperature on task
+#     performance in office environment (LBNL). Used as context for thermal→performance.
+#   Implementation: loss starts above ppd_reference (10%); default slope
+#   ppd_productivity_loss_per_percent=0.5 is a tunable linear proxy (not a single universal law).
+#
+# IAQ / CO2 → productivity:
+#   - Seppänen, O., Fisk, W.J., & Lei, Q.H. (2006). Ventilation and performance in office
+#     work. Indoor Air — performance gains with higher outdoor-air supply (often a few %
+#     over practical ventilation ranges); CO2 used as ventilation/IAQ proxy.
+#   - Wargocki, P., Wyon, D.P., Sundell, J., et al. (2000). The effects of outdoor air
+#     supply rate in an office on perceived air quality, SBS symptoms, and productivity.
+#     Indoor Air, 10(4), 222–236.
+#   - Wargocki, P., et al. meta/analyses of CO2 and task performance (schools/offices);
+#     fractional performance change often expressed per ~100 ppm CO2 (order ~1%/100 ppm
+#     in some pooled analyses — task-dependent, uncertain).
+#   - Allen, J.G., et al. (2016). Associations of cognitive function scores with CO2 /
+#     ventilation (COGfx) — larger cognitive effects at elevated CO2 in controlled studies.
+#   Implementation: loss starts above co2_reference_ppm (800); default
+#   co2_productivity_loss_per_100ppm=0.01 (~1%/100 ppm) is an order-of-magnitude proxy.
 reward:
-  energy_weight: 0.4        # Weight for energy consumption penalty (0-1)
-  # Energy cost = (power_W / 1000) * dt_hours * price; price from realtime_price or energy_price_per_kwh
+  # Electric $ = (power_W / 1000) * dt_hours * price; price from realtime_price or energy_price_per_kwh
+  # Gas $ = gas_kWh * gas_price_per_kwh (no extra weights — already dollars)
   energy_price_per_kwh: 0.1 # Explicit base price ($/kWh) when realtime_price is disabled
+  gas_price_per_kwh: 0.017  # Natural gas price ($/kWh thermal)
   # Real-time price: used in reward and stored in log (energy_price_used)
   realtime_price:
-    enabled: false         # Set true to use time-varying price
-    type: "constant"       # "constant" | "tou"
+    enabled: true
+    type: "csv"            # "constant" | "tou" | "csv"
     constant_price: 0.1    # When type is constant ($/kWh)
+    csv_path: "data/rtp_prices_2023_0412_to_0730.csv"  # Hourly RTP for training window
+    fallback_price: 0.1    # Used if csv has no matching month/day/hour
     tou:                   # When type is tou (hours 0-23)
       peak:    { hours: [12, 13, 14, 15, 16, 17, 18], price: 0.15 }
       off_peak: { hours: [0, 1, 2, 3, 4, 5, 6, 22, 23], price: 0.08 }
       mid:     { price: 0.10 }
-  comfort_weight: 0.5       # Weight for thermal comfort penalty (0-1)
-  setpoint_weight: 0.1      # Weight for setpoint reasonableness penalty (0-1)
-  demand_weight: 0.2        # Weight for demand spike penalty (0-1)
-  # Thermal comfort model: "temperature" = penalty from zone temp vs base_temp ± threshold; "ppd" = penalty from Fanger PPD
-  thermal_comfort_model: "temperature"   # "temperature" | "ppd"
-  comfort_threshold: 1.0     # Temperature deviation threshold (°C) (used when thermal_comfort_model is temperature)
-  ppd_acceptable_max: 10.0    # PPD (%) above which penalty applies (used when thermal_comfort_model is ppd)
-  ppd_penalty_scale: 0.01    # Penalty per zone = max(0, PPD - ppd_acceptable_max) * ppd_penalty_scale, then * comfort_weight
-  demand_threshold: 5.0      # Power demand threshold for penalty (kW)
-  description: "Configurable weights for reward function components"
+
+  # Cost basis for the scalar reward (all $ terms use the same mode):
+  #   absolute — raw $ per timestep (building total)
+  #   per_m2   — divide energy/gas/thermal/IAQ $ by floor_area_m2 → $/m² (better transfer)
+  cost_normalization:
+    mode: "per_m2"         # "absolute" | "per_m2" — use $/m² for transferable cost-based reward
+    floor_area_m2: 4982.0  # DOE Medium Office ~53,628 ft²; set per building when mode=per_m2
+
+  # Labor value used to monetize thermal/IAQ productivity loss ($/person/h).
+  # Transfer knob: change this (or use $/m²/h via occupancy density) per building market.
+  labor_cost_per_person_hour: 40.0
+
+  # Online balancing: scale PPD/CO2 $ toward energy $ using training-run statistics.
+  # After min_samples, comfort_scale ≈ comfort_target_ratio * EMA(energy+gas) / EMA(comfort_raw)
+  # (same for CO2). weight_max: 1.0 → only scale productivity *down* when it dominates.
+  adaptive_balancing:
+    enabled: true
+    ema_alpha: 0.01          # EMA step size (smaller = slower adaptation)
+    min_samples: 100         # warmup steps before scales leave initial_scale
+    comfort_target_ratio: 1.0  # target EMA(weighted comfort) ≈ ratio * EMA(energy)
+    co2_target_ratio: 1.0
+    weight_min: 0.0
+    weight_max: 1.0          # 1.0 = never amplify above static comfort_weight/co2_weight
+    initial_scale: 1.0
+    min_mean: 1.0e-12        # skip scale update if EMA(raw) below this
+
+  # Thermal: PPD → relative productivity loss → $ cost (see sources above)
+  # loss_frac ≈ clamp( (PPD - ppd_reference) * ppd_productivity_loss_per_percent / 100, 0, max )
+  # comfort_cost = loss_frac * people * labor_cost_per_person_hour * dt_hours * comfort_weight * adaptive_comfort_scale
+  thermal_comfort_model: "ppd_productivity"   # "temperature" | "ppd" | "ppd_productivity"
+  comfort_weight: 1.0
+  comfort_threshold: 1.0     # Used only when thermal_comfort_model is temperature
+  ppd_acceptable_max: 10.0   # Used when thermal_comfort_model is "ppd" (soft excess PPD)
+  ppd_penalty_scale: 0.01
+  ppd_reference: 10.0        # ASHRAE-typical design PPD (%); loss starts above this
+  ppd_productivity_loss_per_percent: 0.5  # % productivity loss per 1% PPD above reference
+  ppd_max_productivity_loss: 0.15         # Cap fractional loss (15%)
+
+  # IAQ: floor CO2 → cognitive/productivity loss → $ cost (see sources above)
+  # loss_frac ≈ clamp( (CO2 - co2_reference_ppm) / 100 * co2_productivity_loss_per_100ppm, 0, max )
+  # Occupant-weighted by zone people on each floor; co2_cost *= co2_weight * adaptive_co2_scale
+  co2_weight: 1.0
+  co2_model: "productivity"  # "threshold" | "productivity"
+  co2_threshold_ppm: 1000.0  # Used when co2_model is "threshold"
+  co2_penalty_scale: 0.001
+  co2_reference_ppm: 800.0   # Near outdoor+offset / good IAQ reference for offices
+  co2_productivity_loss_per_100ppm: 0.01  # ~1% productivity loss per +100 ppm (order-of-magnitude)
+  co2_max_productivity_loss: 0.15
+
+  setpoint_weight: 0.0       # Disabled; not a dollar KPI
+  demand_weight: 0.0         # Disabled under RTP (no separate demand charge)
+  demand_threshold: 5.0
+  description: "Dollar energy + PPD/CO2 productivity costs; optional $/m2 normalization"
+
+
+# Occupancy Events: transient occupancy spikes/drops layered on top of the normal
+# People schedule, applied to specific zones during specific hours of the day
+# throughout the simulation. EnergyPlus's People-driven CO2 generation model reacts
+# to the actual occupant count each timestep, so these events directly change
+# per-zone (and floor_co2_ppm) CO2 buildup — no separate CO2 math needed.
+occupancy_events:
+  enabled: true
+  # Name of the "Number of People" schedule shared by the model's People objects
+  # (must match the IDF). Read every timestep (independent of any event override)
+  # so each event's delta scales the *real* scheduled occupancy for that hour,
+  # not a hardcoded assumption.
+  schedule_name: "BLDG_OCC_SCH_wo_SB"
+  events:
+    - name: "morning_meeting_spike"
+      # Zone names (must match CONTROLLED_ZONE_NAMES in rl_hvac_control.py), or a
+      # floor shorthand: "bottom" | "mid" | "top" (expands to all zones on that floor).
+      zones: ["Perimeter_bot_ZN_1", "Perimeter_bot_ZN_2"]
+      hours: [9, 10]          # hour-of-day (0-23), active every simulated day
+      delta: 0.4               # +40% occupancy vs. the scheduled baseline for that hour
+    - name: "afternoon_lull"
+      zones: ["top"]
+      hours: [14, 15]
+      delta: -0.3              # -30% occupancy vs. the scheduled baseline for that hour
 
 # Zone Configuration
 zones:
@@ -193,4 +303,5 @@ normalization:
     month_of_year: [0.0,   1.0]    # already [0,1]
     prev_action:   [-1.0,  1.0]    # tanh output
     outdoor_co2:   [300.0, 1200.0] # ppm
-    zone_co2:      [300.0, 2000.0] # ppm
+    floor_co2:     [300.0, 2000.0] # ppm
+    rtp_price:     [0.02,  0.60]   # $/kWh

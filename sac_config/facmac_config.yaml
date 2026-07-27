@@ -1,0 +1,27 @@
+# FACMAC Agent Configuration
+# Factored Multi-Agent Centralised Policy Gradients for HVAC floor agents
+
+facmac:
+  learning_rate: 0.0001
+  gamma: 0.99
+  tau: 0.005
+  batch_size: 256
+  memory_size: 1000000
+  target_update_interval: 1
+  # Gaussian exploration noise added to deterministic actions during training
+  exploration_noise: 0.1
+  exploration_noise_clip: 0.5
+  grad_clip: 10.0
+  # QMIX-style monotonic mixing (true) or unrestricted nonmonotonic mixer (false)
+  monotonic_mixing: true
+  mixing_embed_dim: 32
+  hypernet_hidden: 64
+
+model:
+  hidden_layers: [256, 256]
+  dropout: 0.0
+  activation: relu
+
+training:
+  device: auto
+  warmup_steps: 288

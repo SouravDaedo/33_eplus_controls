@@ -4,7 +4,7 @@
 # SAC-specific hyperparameters
 sac:
   # Learning rate for all networks (actor, critics, alpha)
-  learning_rate: 0.0003
+  learning_rate: 0.0001
   
   # Discount factor for future rewards
   gamma: 0.99

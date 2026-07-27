@@ -37,55 +37,55 @@ def day_of_year(dt: datetime) -> int:
 
 RUSH_HOUR_EVENTS = [
     # (label, weekdays_only, start_hour, end_hour, peak_hour, amplitude_ppm)
-    ("morning_rush", True,  7,  9, 8,  30.0),
-    ("evening_rush", True, 16, 19, 17, 25.0),
+    ("morning_rush", True,  7,  9, 8,  85.0),
+    ("evening_rush", True, 16, 19, 17, 70.0),
 ]
 
 DEFAULT_ONETIME_EVENTS = [
     # (label, start_month, start_day, start_hour, duration_hours, peak_ppm_increment)
     # Winter stagnant-air pool — mid-January
-    ("winter_inversion",    1, 18,  0, 48,   70.0),
+    ("winter_inversion",    1, 18,  0, 48,  200.0),
     # Factory/plant upset — mid-March afternoon
-    ("industrial_release",  3, 10, 14,  8,   50.0),
+    ("industrial_release",  3, 10, 14,  8,  140.0),
     # Heat inversion smog — late April
-    ("smog_inversion",      4, 22,  0, 36,   80.0),
+    ("smog_inversion",      4, 22,  0, 36,  220.0),
     # Regional air-quality alert — early May
-    ("smoke_alert",         5,  8,  6, 18,   35.0),
+    ("smoke_alert",         5,  8,  6, 18,  100.0),
     # Wildfire smoke episode — early June
-    ("wildfire_smoke",      6,  5,  6, 72,  150.0),
+    ("wildfire_smoke",      6,  5,  6, 72,  350.0),
     # Holiday fireworks / evening combustion — July 4
-    ("holiday_fireworks",   7,  4, 22,  4,   20.0),
+    ("holiday_fireworks",   7,  4, 22,  4,   60.0),
     # Short industrial/traffic pollution spike — mid-July
-    ("pollution_spike",     7, 14, 10, 12,   60.0),
+    ("pollution_spike",     7, 14, 10, 12,  170.0),
     # Late-summer wildfire — mid-August
-    ("wildfire_smoke_2",    8, 18,  8, 60,  120.0),
+    ("wildfire_smoke_2",    8, 18,  8, 60,  300.0),
     # Agricultural field burning — mid-October
-    ("harvest_burn",       10, 15,  7, 12,   45.0),
+    ("harvest_burn",       10, 15,  7, 12,  125.0),
 ]
 
 # Localized highway / corridor backups — 20 one-time jams spread across the year.
-# Morning peaks ~07-09, evening peaks ~16-18; duration 4-7 h; +28 to +44 ppm.
+# Morning peaks ~07-09, evening peaks ~16-18; duration 4-7 h; +85 to +125 ppm.
 TRAFFIC_JAM_EVENTS = [
-    ("traffic_jam_01",  1,  9,  8, 5, 32.0),   # Jan — morning corridor backup
-    ("traffic_jam_02",  1, 22, 17, 6, 38.0),   # Jan — evening slowdown
-    ("traffic_jam_03",  2,  6,  8, 5, 30.0),   # Feb — morning
-    ("traffic_jam_04",  2, 19, 17, 6, 36.0),   # Feb — evening
-    ("traffic_jam_05",  3,  4,  8, 6, 34.0),   # Mar — morning
-    ("traffic_jam_06",  3, 27, 16, 5, 40.0),   # Mar — evening
-    ("traffic_jam_07",  4,  3,  7, 5, 33.0),   # Apr — morning
-    ("traffic_jam_08",  4, 16, 17, 6, 37.0),   # Apr — evening
-    ("traffic_jam_09",  5,  1,  8, 5, 35.0),   # May — morning (holiday return)
-    ("traffic_jam_10",  5, 20, 17, 7, 39.0),   # May — evening
-    ("traffic_jam_11",  6, 11,  8, 6, 36.0),   # Jun — morning
-    ("traffic_jam_12",  6, 24, 16, 5, 42.0),   # Jun — evening
-    ("traffic_jam_13",  7,  8,  7, 5, 34.0),   # Jul — morning
-    ("traffic_jam_14",  7, 25, 17, 6, 38.0),   # Jul — evening
-    ("traffic_jam_15",  8,  5,  8, 5, 33.0),   # Aug — morning
-    ("traffic_jam_16",  8, 28, 16, 7, 41.0),   # Aug — evening
-    ("traffic_jam_17",  9, 12,  8, 6, 35.0),   # Sep — morning
-    ("traffic_jam_18",  9, 26, 17, 5, 37.0),   # Sep — evening
-    ("traffic_jam_19", 10,  7,  8, 6, 34.0),   # Oct — morning
-    ("traffic_jam_20", 12, 18, 16, 7, 44.0),   # Dec — pre-holiday evening gridlock
+    ("traffic_jam_01",  1,  9,  8, 5,  90.0),
+    ("traffic_jam_02",  1, 22, 17, 6, 105.0),
+    ("traffic_jam_03",  2,  6,  8, 5,  85.0),
+    ("traffic_jam_04",  2, 19, 17, 6, 100.0),
+    ("traffic_jam_05",  3,  4,  8, 6,  95.0),
+    ("traffic_jam_06",  3, 27, 16, 5, 110.0),
+    ("traffic_jam_07",  4,  3,  7, 5,  92.0),
+    ("traffic_jam_08",  4, 16, 17, 6, 105.0),
+    ("traffic_jam_09",  5,  1,  8, 5,  98.0),
+    ("traffic_jam_10",  5, 20, 17, 7, 110.0),
+    ("traffic_jam_11",  6, 11,  8, 6, 100.0),
+    ("traffic_jam_12",  6, 24, 16, 5, 120.0),
+    ("traffic_jam_13",  7,  8,  7, 5,  95.0),
+    ("traffic_jam_14",  7, 25, 17, 6, 105.0),
+    ("traffic_jam_15",  8,  5,  8, 5,  92.0),
+    ("traffic_jam_16",  8, 28, 16, 7, 115.0),
+    ("traffic_jam_17",  9, 12,  8, 6,  98.0),
+    ("traffic_jam_18",  9, 26, 17, 5, 105.0),
+    ("traffic_jam_19", 10,  7,  8, 6,  95.0),
+    ("traffic_jam_20", 12, 18, 16, 7, 125.0),
 ]
 
 DEFAULT_ONETIME_EVENTS = DEFAULT_ONETIME_EVENTS + TRAFFIC_JAM_EVENTS
@@ -446,7 +446,7 @@ def main():
     print()
     print("Events included:")
     if not args.no_rush_hour:
-        print("  Rush hour  — weekday morning 07-09 (+30 ppm peak), evening 16-19 (+25 ppm peak)")
+        print("  Rush hour  — weekday morning 07-09 (+85 ppm peak), evening 16-19 (+70 ppm peak)")
     events_in_period = [
         ev for ev in onetime
         if _event_overlaps_period(args.year, ev, start_dt, end_dt)

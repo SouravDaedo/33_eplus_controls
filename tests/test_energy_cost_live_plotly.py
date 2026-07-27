@@ -21,12 +21,64 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
 
-from energy_price_model import (
-    create_tou_pricing,
-    create_rtp_pricing,
-)
+from energy_price_model import create_rtp_pricing
 from battery_model import create_battery, BatteryAction
 from solar_pv_model import create_pv_system
+
+
+def _weather_context_from_pv_state(pv_state):
+    return {
+        "dry_bulb_c": pv_state.ambient_temp_c,
+        "ghi": pv_state.ghi,
+    }
+
+
+def _price_csv_path(weather_file: str, start: datetime, num_hours: int) -> Path:
+    weather_name = Path(weather_file).stem.replace(".", "_")
+    return Path("data") / f"rtp_prices_{weather_name}_{start:%Y%m%d_%H%M}_{num_hours}h.csv"
+
+
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes"}
+
+
+def load_or_create_price_schedule(price_model, pv, start: datetime, num_hours: int, csv_path: Path) -> pd.DataFrame:
+    """
+    Load a precomputed RTP schedule if present; otherwise generate and save one.
+
+    The CSV makes repeated simulation runs deterministic and avoids recalculating
+    the weather-aware RTP series every run.
+    """
+    if csv_path.exists():
+        df = pd.read_csv(csv_path, parse_dates=["timestamp"])
+        if len(df) >= num_hours:
+            print(f"  Price schedule: loaded {csv_path}")
+            return df.iloc[:num_hours].copy()
+        print(f"  Price schedule: {csv_path} has {len(df)} rows, regenerating {num_hours} rows")
+
+    rows = []
+    for hour in range(num_hours):
+        ts = start + timedelta(hours=hour)
+        pv_state = pv.get_power_at_timestep(ts)
+        weather_context = _weather_context_from_pv_state(pv_state)
+        price_state = price_model.get_price(ts, weather=weather_context)
+        rows.append({
+            "timestamp": ts,
+            "price": price_state.price_per_kwh,
+            "price_period": price_state.period_name,
+            "is_peak": price_state.is_peak,
+            "feed_in_rate": price_state.feed_in_rate,
+            "outdoor_temp_c": pv_state.ambient_temp_c,
+            "ghi": pv_state.ghi,
+        })
+
+    df = pd.DataFrame(rows)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv_path, index=False)
+    print(f"  Price schedule: generated {csv_path}")
+    return df
 
 
 def run_simulation_with_plotly(num_hours: int = 24):
@@ -63,32 +115,29 @@ def run_simulation_with_plotly(num_hours: int = 24):
         timestep_minutes=60
     )
     
-    # Use TOU pricing for clearer peak/off-peak behavior
-    # Note: July 15, 2006 was a Saturday, so we need weekday simulation
-    # Let's use a Monday instead (July 17, 2006)
-    from energy_price_model import PricingConfig, PricingType, TOUPeriod, EnergyPriceModel
-    
-    config = PricingConfig(
-        pricing_type=PricingType.TOU,
-        tou_periods=[
-            TOUPeriod("off-peak", 0, 8, 0.06, [0,1,2,3,4,5,6]),   # Night
-            TOUPeriod("mid-peak", 8, 14, 0.12, [0,1,2,3,4,5,6]),  # Morning
-            TOUPeriod("peak", 14, 20, 0.28, [0,1,2,3,4,5,6]),     # Afternoon peak (all days)
-            TOUPeriod("mid-peak", 20, 24, 0.12, [0,1,2,3,4,5,6]), # Evening
-        ],
-        feed_in_tariff=0.05
+    price_model = create_rtp_pricing(
+        base_price=0.11,
+        volatility=0.12,
+        feed_in_tariff=0.05,
     )
-    price_model = EnergyPriceModel(config)
     
     print(f"\nSystem Configuration:")
     print(f"  PV: 75 kW")
     print(f"  Battery: 200 kWh, 50 kW")
-    print(f"  Pricing: TOU (peak: $0.28, off-peak: $0.08)")
+    print(f"  Pricing: weather-aware RTP (daily grid-demand shape + weather)")
     print(f"  Weather: {weather_file}")
     
     # Run simulation and collect all data
     start = datetime(weather_year, 7, 15, 0, 0)
     end = start + timedelta(hours=num_hours)
+    price_schedule_path = _price_csv_path(weather_file, start, num_hours)
+    price_schedule = load_or_create_price_schedule(
+        price_model,
+        pv,
+        start,
+        num_hours,
+        price_schedule_path,
+    )
     
     results = []
     cumulative_cost = 0
@@ -111,10 +160,11 @@ def run_simulation_with_plotly(num_hours: int = 24):
         pv_state = pv.get_power_at_timestep(ts)
         pv_power = pv_state.ac_power_kw
         
-        # Get current price
-        price_state = price_model.get_price(ts)
-        current_price = price_state.price_per_kwh
-        is_peak = price_state.is_peak
+        # Get current price from the precomputed schedule
+        price_row = price_schedule.iloc[hour]
+        current_price = float(price_row["price"])
+        is_peak = _as_bool(price_row["is_peak"])
+        feed_in_rate = float(price_row["feed_in_rate"])
         
         # Improved control strategy
         net_load = building_load - pv_power
@@ -163,20 +213,21 @@ def run_simulation_with_plotly(num_hours: int = 24):
             grid_import = max(0, net_load)
             grid_export = max(0, -net_load)
         
-        # Calculate cost
-        cost_result = price_model.calculate_cost(
-            timestamp=ts,
-            energy_consumed_kwh=grid_import,
-            energy_exported_kwh=grid_export
-        )
-        
-        cumulative_cost += cost_result.import_cost
-        cumulative_credit += cost_result.export_credit
+        # Calculate cost from the CSV price used for this exact timestep
+        import_cost = grid_import * current_price
+        export_credit = grid_export * feed_in_rate
+        hourly_cost = import_cost - export_credit
+
+        cumulative_cost += import_cost
+        cumulative_credit += export_credit
         
         results.append({
             'hour': hour,
             'timestamp': ts,
             'price': current_price,
+            'price_period': price_row["price_period"],
+            'outdoor_temp_c': pv_state.ambient_temp_c,
+            'ghi': pv_state.ghi,
             'is_peak': is_peak,
             'pv': pv_power,
             'load': building_load,
@@ -186,14 +237,15 @@ def run_simulation_with_plotly(num_hours: int = 24):
             'action': action.name,
             'grid_import': grid_import,
             'grid_export': grid_export,
-            'hourly_cost': cost_result.net_cost,
+            'hourly_cost': hourly_cost,
             'cumulative_cost': cumulative_cost,
             'cumulative_credit': cumulative_credit,
             'net_cost': cumulative_cost - cumulative_credit
         })
         
         print(f"  Hour {hour:02d}: Price=${current_price:.2f}, PV={pv_power:.1f}kW, "
-              f"SOC={batt_result.soc_after*100:.1f}%, Action={action.name}")
+              f"Temp={pv_state.ambient_temp_c:.1f}C, SOC={batt_result.soc_after*100:.1f}%, "
+              f"Action={action.name}")
     
     df = pd.DataFrame(results)
     
@@ -202,13 +254,12 @@ def run_simulation_with_plotly(num_hours: int = 24):
     create_animated_plot(df)
     
     # Print summary
-    summary = price_model.get_cost_summary()
     print("\n" + "=" * 60)
     print("SIMULATION COMPLETE")
     print("=" * 60)
-    print(f"Total Import Cost: ${summary['total_import_cost']:.2f}")
-    print(f"Total Export Credit: ${summary['total_export_credit']:.2f}")
-    print(f"Net Energy Cost: ${summary['net_energy_cost']:.2f}")
+    print(f"Total Import Cost: ${cumulative_cost:.2f}")
+    print(f"Total Export Credit: ${cumulative_credit:.2f}")
+    print(f"Net Energy Cost: ${cumulative_cost - cumulative_credit:.2f}")
     print(f"Battery Final SOC: {battery.get_soc():.1%}")
 
 

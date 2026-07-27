@@ -30,7 +30,21 @@ class HVACConfig:
     def _compute_dimensions(self):
         """Compute state and action space dimensions from configuration."""
         # State space dimensions
-        zone_count = self.config['state_space']['zone_temps']['count']
+        zone_temps_cfg = self.config['state_space']['zone_temps']
+        zone_temp_mode = zone_temps_cfg.get('mode', 'zones')
+        zone_count = zone_temps_cfg['count']
+        expected_counts = {'zones': 15, 'perimeter_core': 6, 'floor': 3}
+        if zone_temp_mode not in expected_counts:
+            raise ValueError(
+                f"state_space.zone_temps.mode must be one of {list(expected_counts)}, "
+                f"got {zone_temp_mode!r}"
+            )
+        if zone_count != expected_counts[zone_temp_mode]:
+            raise ValueError(
+                f"state_space.zone_temps.count must be {expected_counts[zone_temp_mode]} "
+                f"when mode is {zone_temp_mode!r}, got {zone_count}"
+            )
+        self.zone_temp_mode = zone_temp_mode
         current_weather_count = len(self.config['state_space']['current_weather'])
 
         # Weather forecast: per-variable list of timesteps-ahead to forecast — each
@@ -56,7 +70,8 @@ class HVACConfig:
         time_features_count = len(self.config['state_space']['time_features'])
         prev_actions_count = self.config['state_space']['previous_actions']['count']
         outdoor_co2_count = self.config['state_space'].get('outdoor_co2_ppm', {}).get('count', 0)
-        zone_co2_count = self.config['state_space'].get('zone_co2_ppm', {}).get('count', 0)
+        floor_co2_count = self.config['state_space'].get('floor_co2_ppm', {}).get('count', 0)
+        rtp_price_count = self.config['state_space'].get('rtp_price', {}).get('count', 0)
 
         # Optional past weather (lagged history), disabled by default
         weather_history_cfg = self.config['state_space'].get('weather_history', {})
@@ -71,7 +86,8 @@ class HVACConfig:
                          time_features_count +
                          prev_actions_count +
                          outdoor_co2_count +
-                         zone_co2_count)
+                         floor_co2_count +
+                         rtp_price_count)
         
         # Action space dimensions
         self.action_size = len(self.config['action_space'])
@@ -180,7 +196,8 @@ class HVACConfig:
         n_time      = len(ss['time_features'])
         n_prev      = ss['previous_actions']['count']
         n_out_co2   = ss.get('outdoor_co2_ppm', {}).get('count', 0)
-        n_zone_co2  = ss.get('zone_co2_ppm',    {}).get('count', 0)
+        n_floor_co2 = ss.get('floor_co2_ppm',   {}).get('count', 0)
+        n_rtp       = ss.get('rtp_price',       {}).get('count', 0)
         past_horizon = self.weather_history_horizon
         wf = self.weather_forecast_offsets
 
@@ -209,7 +226,8 @@ class HVACConfig:
             _b('month_of_year',  0.0,   1.0,  1) +
             _b('prev_action',   -1.0,   1.0,  n_prev) +
             _b('outdoor_co2',  300.0, 1200.0, n_out_co2) +
-            _b('zone_co2',     300.0, 2000.0, n_zone_co2)
+            _b('floor_co2',    300.0, 2000.0, n_floor_co2) +
+            _b('rtp_price',      0.02,  0.60,  n_rtp)
         )
 
         mins = np.array([p[0] for p in pairs], dtype=np.float32)
@@ -227,7 +245,8 @@ class HVACConfig:
         print(f"  Episode timesteps: {self.episode_timesteps}")
         print(f"\nState Space:")
         print(f"  State size: {self.state_size}")
-        print(f"  Zone temperatures: {self.config['state_space']['zone_temps']['count']}")
+        print(f"  Zone temperatures: {self.config['state_space']['zone_temps']['count']} "
+              f"(mode={getattr(self, 'zone_temp_mode', 'zones')})")
         print(f"  Current weather: {len(self.config['state_space']['current_weather'])}")
         wf = self.weather_forecast_offsets
         print(f"  Weather forecast offsets: oat={wf['oat']}, humidity={wf['humidity']}, cloud_cover={wf['cloud_cover']}")
@@ -248,7 +267,8 @@ class HVACConfig:
         print(f"\nControl:")
         print(f"  Base temperature: {self.base_temperature}°C")
         print(f"  Deadband range: [{self.deadband_min}, {self.deadband_max}]°C")
-        print(f"  Airflow range: [{self.min_airflow}, {self.max_airflow}] m³/s")
+        oa_bounds = self.action_bounds['airflow_multiplier']
+        print(f"  AHU OA controller mass flow command range: [{oa_bounds[0]}, {oa_bounds[1]}] kg/s")
         print("=" * 60)
 
 

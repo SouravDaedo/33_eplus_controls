@@ -11,7 +11,7 @@ Author: Generated for EnergyPlus Controls Project
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Tuple, Callable
+from typing import Optional, List, Dict, Tuple, Callable, Any
 from datetime import datetime, timedelta
 from enum import Enum
 import math
@@ -57,6 +57,10 @@ class PricingConfig:
     # RTP/Dynamic pricing parameters
     base_price: float = 0.10  # Base price for RTP ($/kWh)
     price_volatility: float = 0.3  # Price volatility factor (0-1)
+    min_price: float = 0.02  # Minimum RTP price ($/kWh)
+    max_price: float = 0.60  # Maximum RTP price ($/kWh)
+    weather_sensitivity: float = 0.35  # RTP sensitivity to weather-driven grid demand
+    solar_sensitivity: float = 0.15  # RTP discount when solar generation is abundant
     
     # Wholesale market simulation parameters
     wholesale_base: float = 0.05  # Base wholesale price ($/kWh)
@@ -133,7 +137,7 @@ class EnergyPriceModel:
         self.config = config or PricingConfig()
         self.price_history: List[PriceState] = []
         self.cost_history: List[EnergyCostResult] = []
-        self._rtp_cache: Dict[datetime, float] = {}
+        self._rtp_cache: Dict[Tuple[Any, ...], float] = {}
         
         # Seed for reproducible RTP generation
         self._rng = np.random.default_rng(42)
@@ -146,12 +150,14 @@ class EnergyPriceModel:
         if seed is not None:
             self._rng = np.random.default_rng(seed)
     
-    def get_price(self, timestamp: datetime) -> PriceState:
+    def get_price(self, timestamp: datetime, weather: Optional[Dict[str, float]] = None) -> PriceState:
         """
         Get electricity price for a specific timestamp.
         
         Args:
             timestamp: Datetime for price lookup
+            weather: Optional weather/grid context for RTP, e.g.
+                {"dry_bulb_c": 34.0, "ghi": 800.0}
             
         Returns:
             PriceState with current pricing information
@@ -161,7 +167,7 @@ class EnergyPriceModel:
         elif self.config.pricing_type == PricingType.TOU:
             price, period_name, is_peak = self._get_tou_price(timestamp)
         elif self.config.pricing_type == PricingType.RTP:
-            price, period_name, is_peak = self._get_rtp_price(timestamp)
+            price, period_name, is_peak = self._get_rtp_price(timestamp, weather)
         elif self.config.pricing_type == PricingType.DYNAMIC:
             price, period_name, is_peak = self._get_dynamic_price(timestamp)
         elif self.config.pricing_type == PricingType.WHOLESALE:
@@ -209,27 +215,37 @@ class EnergyPriceModel:
         # Default to base price if no period matches
         return self.config.base_price, "default", False
     
-    def _get_rtp_price(self, timestamp: datetime) -> Tuple[float, str, bool]:
+    def _get_rtp_price(
+        self,
+        timestamp: datetime,
+        weather: Optional[Dict[str, float]] = None
+    ) -> Tuple[float, str, bool]:
         """
-        Generate Real-Time Price using stochastic model.
+        Generate Real-Time Price using a demand-shaped model.
         
         Uses a combination of:
-        - Daily pattern (higher during day, lower at night)
-        - Random walk component
-        - Mean reversion
+        - Daily grid demand pattern (morning/evening peaks, lower overnight)
+        - Weekend and seasonal effects
+        - Weather-driven cooling/heating demand when dry-bulb temperature is provided
+        - Solar scarcity/abundance when GHI is provided
+        - Small bounded volatility so prices are not fully random
         """
         # Round to hour for caching
         hour_key = timestamp.replace(minute=0, second=0, microsecond=0)
+        weather_key = self._weather_cache_key(weather)
+        cache_key = (hour_key, weather_key)
         
-        if hour_key in self._rtp_cache:
-            price = self._rtp_cache[hour_key]
+        if cache_key in self._rtp_cache:
+            price = self._rtp_cache[cache_key]
         else:
             hour = timestamp.hour
             day_of_week = timestamp.weekday()
             
-            # Base daily pattern (sinusoidal)
-            # Peak around 2-6 PM, lowest around 3-5 AM
-            daily_factor = 0.5 + 0.5 * math.sin((hour - 3) * math.pi / 12)
+            # Grid demand shape: low overnight, morning ramp, afternoon/evening peak.
+            overnight = 0.65
+            morning_peak = 0.30 * math.exp(-((hour - 8) / 3.0) ** 2)
+            evening_peak = 0.55 * math.exp(-((hour - 17) / 4.0) ** 2)
+            daily_factor = overnight + morning_peak + evening_peak
             
             # Weekend discount
             weekend_factor = 0.8 if day_of_week >= 5 else 1.0
@@ -243,20 +259,24 @@ class EnergyPriceModel:
             else:
                 seasonal_factor = 1.0
             
-            # Random component
-            random_factor = 1 + self.config.price_volatility * (self._rng.random() - 0.5)
+            weather_factor = self._weather_grid_demand_factor(timestamp, weather)
+            solar_factor = self._solar_price_factor(weather)
+            
+            # Small bounded stochastic term. The weather and daily shape remain dominant.
+            random_factor = 1 + min(self.config.price_volatility, 0.25) * (self._rng.random() - 0.5)
             
             # Calculate price
             price = (self.config.base_price * 
                     daily_factor * 
                     weekend_factor * 
                     seasonal_factor * 
+                    weather_factor *
+                    solar_factor *
                     random_factor)
             
-            # Ensure minimum price
-            price = max(0.02, price)
+            price = min(max(self.config.min_price, price), self.config.max_price)
             
-            self._rtp_cache[hour_key] = price
+            self._rtp_cache[cache_key] = price
         
         # Determine period name based on price level
         if price > self.config.base_price * 1.5:
@@ -270,6 +290,54 @@ class EnergyPriceModel:
             is_peak = False
         
         return price, period_name, is_peak
+
+    def _weather_cache_key(self, weather: Optional[Dict[str, float]]) -> Tuple[Optional[float], Optional[float]]:
+        """Cache RTP by rounded weather inputs that affect grid demand."""
+        if not weather:
+            return (None, None)
+        dry_bulb = self._weather_value(weather, "dry_bulb_c", "temperature_c", "ambient_temp_c")
+        ghi = self._weather_value(weather, "ghi", "global_horizontal_irradiance")
+        return (
+            round(dry_bulb, 1) if dry_bulb is not None else None,
+            round(ghi, 0) if ghi is not None else None,
+        )
+
+    def _weather_value(self, weather: Dict[str, float], *keys: str) -> Optional[float]:
+        for key in keys:
+            if key in weather and weather[key] is not None:
+                return float(weather[key])
+        return None
+
+    def _weather_grid_demand_factor(
+        self,
+        timestamp: datetime,
+        weather: Optional[Dict[str, float]]
+    ) -> float:
+        """Approximate grid load pressure from heating/cooling degree stress."""
+        if not weather:
+            return 1.0
+        dry_bulb = self._weather_value(weather, "dry_bulb_c", "temperature_c", "ambient_temp_c")
+        if dry_bulb is None:
+            return 1.0
+
+        cooling_stress = max(0.0, dry_bulb - 24.0) / 12.0
+        heating_stress = max(0.0, 12.0 - dry_bulb) / 18.0
+        stress = min(1.5, cooling_stress + heating_stress)
+
+        # Hot afternoons tend to stress summer grids more than hot nights.
+        afternoon_multiplier = 1.25 if 14 <= timestamp.hour <= 20 else 1.0
+        return 1.0 + self.config.weather_sensitivity * stress * afternoon_multiplier
+
+    def _solar_price_factor(self, weather: Optional[Dict[str, float]]) -> float:
+        """Discount RTP when solar irradiance is high, raise it slightly when scarce."""
+        if not weather:
+            return 1.0
+        ghi = self._weather_value(weather, "ghi", "global_horizontal_irradiance")
+        if ghi is None:
+            return 1.0
+
+        solar_abundance = min(1.0, max(0.0, ghi / 900.0))
+        return 1.0 + self.config.solar_sensitivity * (0.5 - solar_abundance)
     
     def _get_dynamic_price(self, timestamp: datetime, 
                            load_factor: float = 1.0) -> Tuple[float, str, bool]:
@@ -352,7 +420,8 @@ class EnergyPriceModel:
         timestamp: datetime,
         energy_consumed_kwh: float,
         energy_exported_kwh: float = 0.0,
-        timestep_hours: float = 1.0
+        timestep_hours: float = 1.0,
+        weather: Optional[Dict[str, float]] = None
     ) -> EnergyCostResult:
         """
         Calculate energy cost for a timestep.
@@ -362,12 +431,13 @@ class EnergyPriceModel:
             energy_consumed_kwh: Energy consumed from grid (kWh)
             energy_exported_kwh: Energy exported to grid (kWh)
             timestep_hours: Duration of timestep in hours
+            weather: Optional weather/grid context passed to RTP pricing
             
         Returns:
             EnergyCostResult with cost breakdown
         """
         # Get current price
-        price_state = self.get_price(timestamp)
+        price_state = self.get_price(timestamp, weather=weather)
         
         # Calculate import cost
         import_cost = energy_consumed_kwh * price_state.price_per_kwh
@@ -507,20 +577,32 @@ def create_tou_pricing(
 def create_rtp_pricing(
     base_price: float = 0.10,
     volatility: float = 0.3,
-    feed_in_tariff: float = 0.05
+    feed_in_tariff: float = 0.05,
+    weather_sensitivity: float = 0.35,
+    solar_sensitivity: float = 0.15,
+    min_price: float = 0.02,
+    max_price: float = 0.60
 ) -> EnergyPriceModel:
     """
     Create a Real-Time Pricing model.
     
     Args:
         base_price: Base electricity price ($/kWh)
-        volatility: Price volatility factor (0-1)
+        volatility: Small bounded price volatility factor (0-1)
         feed_in_tariff: Export rate ($/kWh)
+        weather_sensitivity: Price sensitivity to heating/cooling grid stress
+        solar_sensitivity: Price discount when solar irradiance is abundant
+        min_price: Minimum RTP price ($/kWh)
+        max_price: Maximum RTP price ($/kWh)
     """
     config = PricingConfig(
         pricing_type=PricingType.RTP,
         base_price=base_price,
         price_volatility=volatility,
+        weather_sensitivity=weather_sensitivity,
+        solar_sensitivity=solar_sensitivity,
+        min_price=min_price,
+        max_price=max_price,
         feed_in_tariff=feed_in_tariff
     )
     return EnergyPriceModel(config)

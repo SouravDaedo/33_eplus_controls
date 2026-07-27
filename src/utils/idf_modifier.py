@@ -42,6 +42,24 @@ def _ensure_output_meter(lines, meter_name, frequency='Timestep', comment=None):
     lines.append(f'  Output:Meter,{meter_name},{frequency};')
 
 
+def _has_output_energy_management_system(lines):
+    pattern = re.compile(r'^\s*Output:EnergyManagementSystem\s*,', re.IGNORECASE)
+    return any(pattern.search(line) for line in lines if not line.strip().startswith('!'))
+
+
+def _ensure_output_energy_management_system(lines):
+    if _has_output_energy_management_system(lines):
+        return
+    lines.extend([
+        '',
+        '! Injected for RL diagnostics: write eplusout.edd actuator/internal variable dictionary',
+        '  Output:EnergyManagementSystem,',
+        '    Verbose,                  !- Actuator Availability Dictionary Reporting',
+        '    Verbose,                  !- Internal Variable Availability Dictionary Reporting',
+        '    ErrorsOnly;               !- EMS Runtime Language Debug Output Level',
+    ])
+
+
 def _apply_current_energyplus_compatibility(lines):
     """Apply small IDF compatibility fixes for the installed EnergyPlus schema."""
     updated_lines = []
@@ -62,6 +80,106 @@ def _apply_current_energyplus_compatibility(lines):
     return updated_lines
 
 
+def _remove_named_idf_objects(lines, object_names):
+    """Remove complete IDF objects whose Name field matches one of object_names."""
+    removed = []
+    kept = []
+    i = 0
+    object_names_lower = {name.lower() for name in object_names}
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith('!') or stripped.endswith(';'):
+            kept.append(line)
+            i += 1
+            continue
+
+        block = [line]
+        i += 1
+        while i < len(lines):
+            block.append(lines[i])
+            done = ';' in lines[i]
+            i += 1
+            if done:
+                break
+
+        name_line = block[1] if len(block) > 1 else ''
+        name = re.split(r'[!,;]', name_line, maxsplit=1)[0].strip().lower()
+        if name in object_names_lower:
+            removed.append(name)
+        else:
+            kept.extend(block)
+
+    if removed:
+        print(f"Removed {len(removed)} EMS OA max-fraction override objects for RL control")
+    return kept
+
+
+def _force_compact_schedules_always_on(lines, schedule_names):
+    """
+    Rewrite Schedule:Compact objects so named schedules are constantly 1.0.
+
+    Needed so RL outdoor-air mass-flow actuators can be delivered 24/7. The
+    stock MediumOffice model gates AHU fans with HVACOperationSchd and min-OA /
+    DCV with MinOA_MotorizedDamper_Sched (both 0 outside occupied hours).
+    """
+    targets = {name.lower() for name in schedule_names}
+    rewritten = []
+    kept = []
+    i = 0
+
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if not re.match(r'(?i)^Schedule:Compact\s*,', stripped):
+            kept.append(line)
+            i += 1
+            continue
+
+        block = [line]
+        i += 1
+        while i < len(lines):
+            block.append(lines[i])
+            done = ';' in lines[i]
+            i += 1
+            if done:
+                break
+
+        name_line = block[1] if len(block) > 1 else ''
+        name = re.split(r'[!,;]', name_line, maxsplit=1)[0].strip()
+        type_line = block[2] if len(block) > 2 else '    Fraction,                !- Schedule Type Limits Name'
+        type_token = re.split(r'[!,;]', type_line, maxsplit=1)[0].rstrip()
+        if not type_token.strip():
+            type_token = '    Fraction'
+
+        if name.lower() in targets:
+            kept.extend([
+                '  Schedule:Compact,',
+                f'    {name},',
+                f'{type_token},                !- Schedule Type Limits Name',
+                '    Through: 12/31,          !- Field 1',
+                '    For: AllDays,            !- Field 2',
+                '    Until: 24:00,1.0;        !- Field 3',
+            ])
+            rewritten.append(name)
+        else:
+            kept.extend(block)
+
+    if rewritten:
+        print(
+            "Forced always-on HVAC/OA schedules for RL OA tracking: "
+            + ", ".join(rewritten)
+        )
+    else:
+        missing = sorted(targets)
+        print(
+            "Warning: could not find schedules to force always-on for RL OA tracking: "
+            + ", ".join(missing)
+        )
+    return kept
+
+
 def create_custom_idf(
     original_idf_path,
     start_month,
@@ -72,6 +190,7 @@ def create_custom_idf(
     outdoor_co2_ppm=None,
     outdoor_co2_csv_path=None,
     outdoor_co2_fallback_ppm=None,
+    occupancy_schedule_name=None,
 ):
     """
     Create a modified IDF file with custom simulation period.
@@ -86,6 +205,13 @@ def create_custom_idf(
         outdoor_co2_ppm: If set (and outdoor_co2_csv_path not set), constant outdoor CO2 (ppm)
         outdoor_co2_csv_path: If set, use time-varying outdoor CO2 from CSV (Schedule:File)
         outdoor_co2_fallback_ppm: Required ppm value when building a schedule from CSV with missing hours
+        occupancy_schedule_name: If set, declare an Output:Variable for this schedule's
+            "Schedule Value" so occupancy_events can read the natural occupancy fraction
+            at runtime (independent of any People actuator override)
+
+    Notes:
+        Also forces HVACOperationSchd and MinOA_MotorizedDamper_Sched to always-on so
+        the RL outdoor-air mass-flow actuator can be delivered in unoccupied hours.
 
     Returns:
         Path to modified IDF file
@@ -202,6 +328,27 @@ def create_custom_idf(
         raise ValueError("No RunPeriod found in IDF file")
 
     new_lines = _apply_current_energyplus_compatibility(new_lines)
+    new_lines = _remove_named_idf_objects(
+        new_lines,
+        {
+            'pacu_vav_bot_MAX_OA_FRAC_Prog_Manager',
+            'pacu_vav_mid_MAX_OA_FRAC_Prog_Manager',
+            'pacu_vav_top_MAX_OA_FRAC_Prog_Manager',
+            'pacu_vav_bot_MAX_OA_FRAC',
+            'pacu_vav_mid_MAX_OA_FRAC',
+            'pacu_vav_top_MAX_OA_FRAC',
+        },
+    )
+    # Keep AHU fans / OA dampers available 24/7 so the RL OA mass-flow actuator
+    # is tracked in both occupied and unoccupied hours (stock schedules turn
+    # HVACOperationSchd and MinOA_MotorizedDamper_Sched off overnight).
+    new_lines = _force_compact_schedules_always_on(
+        new_lines,
+        {
+            'HVACOperationSchd',
+            'MinOA_MotorizedDamper_Sched',
+        },
+    )
 
     # Check if SizingPeriod objects are preserved
     sizing_periods = [line for line in new_lines if 'SizingPeriod:' in line]
@@ -226,6 +373,27 @@ def create_custom_idf(
         'NaturalGas:Facility',
         comment='! Injected for RL: facility natural gas meter (J per timestep)',
     )
+    _ensure_output_variable(
+        new_lines,
+        'Air System Outdoor Air Mass Flow Rate',
+        key='*',
+        comment='! Injected for RL: AHU outdoor air mass flow feedback (kg/s)',
+    )
+    _ensure_output_variable(
+        new_lines,
+        'Air System Outdoor Air Mechanical Ventilation Requested Mass Flow Rate',
+        key='*',
+        comment='! Injected for RL diagnostics: AHU mechanical ventilation OA request (kg/s)',
+    )
+    _ensure_output_energy_management_system(new_lines)
+
+    if occupancy_schedule_name:
+        _ensure_output_variable(
+            new_lines,
+            'Schedule Value',
+            key=occupancy_schedule_name,
+            comment='! Injected for RL: occupancy schedule fraction (baseline for occupancy_events overrides)',
+        )
 
     weather_variables = [
         'Site Outdoor Air Drybulb Temperature',

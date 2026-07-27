@@ -107,14 +107,14 @@ The core file. Runs EnergyPlus with the SAC agent controlling three actions per 
 |--------|-----|-------|---------|
 | Setpoint offset | `sp_offset` | −5 to +5 °C | Shifts heating and cooling setpoints equally from `base_temperature` |
 | Deadband | `deadband` | 2 to 10 °C | Gap between heating and cooling setpoints |
-| Airflow multiplier | `airflow_multiplier` | 0.1 to 2.0 | Scales outdoor air infiltration rate |
+| AHU outdoor-air mass flow | `airflow_multiplier` | 0.0 to 6.0 kg/s | Commands the outdoor-air controller mass flow for each floor PACU |
 
 **Reward components** (all configurable in `hvac_config.yaml`):
 
 | Component | Description |
 |-----------|-------------|
-| `elec_cost` | Electricity cost: `kWh × price × energy_weight` |
-| `gas_cost` | Gas cost: `kWh_thermal × gas_price × gas_weight` |
+| `elec_cost` | Electricity cost: `kWh × RTP` ($) |
+| `gas_cost` | Gas cost: `kWh_thermal × gas_price_per_kwh` ($) |
 | `comfort` | Penalty when zone temps deviate from setpoint by more than `comfort_threshold` |
 | `demand_penalty` | Penalty when electricity demand exceeds `demand_threshold` [kW] |
 | `setpoint` | Small penalty for extreme or narrow setpoints |
@@ -272,10 +272,209 @@ This example runs one 24-hour episode from June 6 at 13:00 through June 7 at 13:
 | Section | Key settings |
 |---------|-------------|
 | `simulation` | `idf_path`, `timesteps_per_hour`, `training_window` (date/time range for RL), `episode_duration_hours`, `outdoor_co2_ppm`, `outdoor_co2_csv_path`, `outdoor_co2_fallback_ppm` |
-| `action_space` | `sp_offset` bounds, `deadband` bounds, `airflow_multiplier` bounds |
-| `reward` | `energy_weight`, `gas_weight`, `gas_price_per_kwh`, `comfort_weight`, `demand_weight`, `demand_threshold` [kW], `energy_price_per_kwh`, TOU pricing config |
-| `zones` | Zone names (15 zones) and group definitions (core, perimeter tiers) |
-| `weather_files` | Named EPW paths (default, summer, chicago, etc.) |
+| `action_space` | `sp_offset` bounds, `deadband` bounds, `airflow_multiplier` bounds for AHU outdoor-air controller mass flow |
+| `reward` | Dollar costs: RTP energy, optional gas; PPD→productivity and CO₂→productivity; `cost_normalization` (`absolute` \| `per_m2`); see **Reward function** below |
+
+---
+
+### Reward function (energy + productivity costs)
+
+Paper-ready equations (LaTeX): [`docs/reward_formulation.md`](docs/reward_formulation.md).
+
+The RL reward is the negative of a multi-term **cost**. With the current defaults, the main terms are all in **dollars** (or optionally **$/m²**) so energy, thermal comfort, and IAQ are on one scale:
+
+\[
+\text{reward} = -(\text{elec \$} + \text{gas \$} + \text{thermal productivity \$} + \text{IAQ productivity \$})
+\]
+
+Shared monetization of a fractional productivity loss (engineering cost-benefit step, not prescribed by the papers):
+
+\[
+\$ = \text{loss\_frac} \times \text{people} \times \texttt{labor\_cost\_per\_person\_hour} \times \Delta t
+\]
+
+People counts are used **only in the reward** (from EnergyPlus). They are not required in the policy observation (floor CO₂ is the transferable IAQ signal).
+
+#### Scale discussion: productivity vs energy (the multi-objective problem)
+
+Putting energy, thermal, and IAQ on a common `$` axis does **not** by itself make them equally important to the RL agent. Energy is priced by the market (RTP). Productivity is priced by **literature fractional losses × occupancy × wage**. Those two pipelines were never fitted to each other, so the default reward can be **strongly lopsided toward comfort/IAQ** whenever the building is occupied and conditions leave the reference band.
+
+##### What the papers report (fractional productivity loss)
+
+Representative **loss fractions** from the sources used above (not our default slopes—raw reported magnitudes):
+
+| Source | Condition (summary) | Reported / cited loss |
+|--------|---------------------|------------------------|
+| **Lan, Wargocki & Lian (2011)** / REHVA summaries | Mild thermal-band effects (conservative Cat. III–style reading) | ~**0.5%** |
+| **Kosonen & Tan (2004)** | PMV ≈ **+0.5** (warm edge of typical comfort), **thinking** tasks | ~**12%** |
+| **Kosonen & Tan (2004)** | Same PMV ≈ **+0.5**, **typing** tasks | ~**26%** |
+| **Seppänen, Fisk & Lei (2006)** | ~**1–3%** performance change per **+10 L/s·person** outdoor air (office work meta-analysis) | **1%, 2%, 3%** |
+| **CO₂ / ventilation proxies** (Wargocki-type summaries used in engineering models) | Roughly **~1% per +100 ppm** CO₂ above a good-IAQ reference (task-dependent; uncertain) | e.g. **1–4%** for +100–400 ppm |
+
+Take **medians of these reported fractions** (simple, transparent summary of the literature spread—not a meta-analysis):
+
+| Domain | Values used | **Median loss_frac** |
+|--------|-------------|----------------------|
+| Thermal | 0.5%, 12%, 26% | **12%** |
+| IAQ / ventilation | 1%, 2%, 3% | **2%** |
+| CO₂ proxy | 1%, 2%, 4% | **2%** |
+
+##### Scale by number of people in *this* building
+
+DOE Medium Office here: `floor_area_m2 ≈ 4982`, IDF `Floor Area per Person ≈ 18.58 m²/person` → design occupancy
+
+\[
+N_{\text{design}} \approx 4982 / 18.58 \approx \mathbf{268\ people}
+\]
+
+(Actual timestep people follow the occupancy schedule; peaks approach this order of magnitude.)
+
+With default monetization `labor_cost_per_person_hour = $40` and \(\Delta t = 0.25\) h (15 min):
+
+\[
+\$_{\text{step}} = \text{loss\_frac} \times N \times 40 \times 0.25 = \text{loss\_frac} \times N \times 10
+\]
+
+At **design occupancy**, paper-median losses become:
+
+| Term | Median loss | Absolute `$` / 15‑min step | `$/m²` / step (`÷ 4982`) |
+|------|-------------|----------------------------|---------------------------|
+| Thermal (median **12%**) | 0.12 | **~$322** | ~$0.065 |
+| IAQ vent / CO₂ proxy (median **2%**) | 0.02 | **~$54** | ~$0.011 |
+
+##### Compare to median energy cost
+
+For the training RTP file `data/rtp_prices_2023_0412_to_0730.csv`, **median price ≈ $0.101 / kWh**. Electric cost per step is `kW × 0.25 × RTP`:
+
+| Electric load | `$` / step at median RTP | `$/m²` / step |
+|---------------|--------------------------|---------------|
+| 30 kW | ~$0.76 | ~$0.00015 |
+| **50 kW** (illustrative mid load) | **~$1.27** | ~$0.00025 |
+| 80 kW | ~$2.03 | ~$0.00041 |
+
+**Median-to-median ratio** (design occupancy, wage $40/h, vs ~50 kW at median RTP):
+
+| Productivity term | ≈ multiple of electric `$` |
+|-------------------|----------------------------|
+| Thermal (12%) | **~250×** |
+| IAQ / CO₂ (2%) | **~40×** |
+
+So: if you literally apply paper-scale fractional losses to **all occupants** at a full wage, **labor-productivity `$` dominates energy `$` by 1–2 orders of magnitude**. That is economically unsurprising (labor ≫ HVAC energy in offices) but it is a **problem for multi-objective RL**: the policy will almost always trade energy for tiny comfort/IAQ gains.
+
+`cost_normalization: per_m2` does **not** fix this—it divides every `$` term by the same area, so **ratios stay the same**.
+
+##### Implications for this control problem
+
+1. **Literal “full wage × paper loss”** encodes a building-economics objective (maximize labor output), not a balanced HVAC tradeoff.
+2. **Default config slopes** (`ppd_productivity_loss_per_percent = 0.5`, `co2_productivity_loss_per_100ppm = 0.01`) are **order-of-magnitude proxies** inspired by the same literature; they are **not** calibrated so that median productivity `$` ≈ median energy `$`.
+3. For RL training where energy *and* comfort/IAQ should both matter, **predetermine a target mix** and scale productivity down, e.g.:
+   - `comfort_weight` / `co2_weight` (direct), or
+   - lower `labor_cost_per_person_hour`, or
+   - softer loss slopes.
+4. A transparent balancing rule: choose weights so that **at the paper-median loss and typical occupied people / typical kW**, productivity `$` and electric `$` are within a chosen factor (e.g. 1×–3×). Example (design `N`, 50 kW, median RTP):  
+   `comfort_weight ≈ 1.27/322 ≈ 0.004`, `co2_weight ≈ 1.27/54 ≈ 0.024` to match medians one-to-one—then tune from live KPI plots.
+
+##### Practical reading of the live cost panel
+
+- Unoccupied (`people ≈ 0`): productivity `$` ≈ 0 → reward is energy-driven.
+- Occupied + PPD/CO₂ above references: without down-weighting, thermal/IAQ traces will dwarf electric—**expected under full-wage monetization**, not a pricing bug.
+
+#### Adaptive balancing (online PPD / CO₂ scales)
+
+Instead of fixing `comfort_weight` / `co2_weight` by hand, you can let training data set **variable scales** that update as more timesteps arrive:
+
+```yaml
+reward:
+  adaptive_balancing:
+    enabled: true
+    ema_alpha: 0.01
+    min_samples: 100
+    comfort_target_ratio: 1.0   # aim EMA(scaled comfort) ≈ 1× EMA(energy+gas)
+    co2_target_ratio: 1.0
+    weight_min: 0.0
+    weight_max: 1.0             # only scale productivity *down*
+    initial_scale: 1.0
+```
+
+Each step (before `/m²` normalization):
+
+1. Compute raw thermal / IAQ `$` (literature × people × wage × Δt).
+2. Update EMAs of `energy+gas`, `comfort_raw`, `co2_raw`.
+3. After `min_samples`:
+   - `adaptive_comfort_scale = clip(comfort_target_ratio × EMA_E / EMA_C, weight_min, weight_max)`
+   - same for CO₂.
+4. Final term: `raw × static_weight × adaptive_scale`.
+
+Logged columns: `adaptive_comfort_scale`, `adaptive_co2_scale`, `adaptive_balancing_active`, `adaptive_n_samples`.
+
+With `weight_max: 1.0`, productivity is never amplified above the static weights—only reduced when its running mean exceeds the energy mean. Set `comfort_target_ratio: 0.5` if you want thermal to contribute about half of energy on average.
+
+#### Cost normalization
+
+```yaml
+reward:
+  cost_normalization:
+    mode: "absolute"       # or "per_m2"
+    floor_area_m2: 4982.0  # required when mode is per_m2 (DOE Medium Office ≈ 53,628 ft²)
+```
+
+| `mode` | Meaning |
+|--------|---------|
+| `absolute` | Building-total `$` per timestep (default) |
+| `per_m2` | Divide energy / gas / thermal / IAQ `$` by `floor_area_m2` → `$/m²` (better for transfer across building sizes) |
+
+Demand and setpoint penalties default to weight `0` under RTP (no separate demand charge in the modeled tariff).
+
+#### Thermal: PPD → productivity → $
+
+Default model: `thermal_comfort_model: "ppd_productivity"`.
+
+\[
+\text{loss\_frac} = \mathrm{clip}\big((PPD - \texttt{ppd\_reference}) \times \texttt{ppd\_productivity\_loss\_per\_percent} / 100,\; 0,\; \texttt{ppd\_max\_productivity\_loss}\big)
+\]
+
+Defaults: reference **10% PPD**, slope **0.5% productivity per 1% PPD** above reference, cap **15%**.
+
+| Source | What it says | How it is used here |
+|--------|----------------|---------------------|
+| **ASHRAE Standard 55** | Comfort is often designed around roughly **≤10% PPD** (typical criterion, not a productivity law). | Sets **`ppd_reference = 10`**: no productivity penalty until PPD exceeds that band. |
+| **Kosonen & Tan** (PMV/PPD–productivity) | Link **thermal dissatisfaction (PPD)** to **work performance / productivity loss** for economic HVAC assessment. | Justifies using **PPD** (not raw °C error) as the discomfort metric. |
+| **Lan, Wargocki & Lian (2011)**, *Energy and Buildings* | Quantify that **thermal discomfort reduces productivity**; support monetizing discomfort. | Supports turning discomfort into a **% productivity loss**, then `$`. We do **not** copy their exact lab curve; we use a simple linear slope above 10% PPD. |
+| **Seppänen / Fisk** (temperature–performance) | Task performance varies with **temperature**; effects often on the order of **a few percent** over realistic ranges. | Background that thermal conditions affect performance. EnergyPlus **Fanger PPD** is used as the comfort proxy. |
+
+The slope `ppd_productivity_loss_per_percent` is a **tunable linear proxy**, not a universal constant from one paper.
+
+#### IAQ: CO₂ → productivity → $
+
+Default model: `co2_model: "productivity"` (floor-average CO₂, occupant-weighted per floor).
+
+\[
+\text{loss\_frac} = \mathrm{clip}\big((CO_2 - \texttt{co2\_reference\_ppm}) / 100 \times \texttt{co2\_productivity\_loss\_per\_100ppm},\; 0,\; \texttt{co2\_max\_productivity\_loss}\big)
+\]
+
+Defaults: reference **800 ppm**, slope **~1% productivity per +100 ppm**, cap **15%**.
+
+| Source | What it says | How it is used here |
+|--------|----------------|---------------------|
+| **Seppänen, Fisk & Lei (2006)**, *Indoor Air* | Higher **outdoor-air ventilation** is associated with better **office work performance** (often ~**1–3%** over practical L/s·person ranges). CO₂ is a common **ventilation/IAQ proxy**. | Supports: worse ventilation/IAQ → **small % performance loss**. **Floor CO₂** is the measurable signal. |
+| **Wargocki et al. (2000)**, *Indoor Air* | Changing **outdoor air supply** affects perceived air quality, SBS symptoms, and **productivity** on simulated tasks (typically a **few percent**). | Same idea; we monetize IAQ via CO₂ rather than OA L/s·person in the reward. |
+| **Wargocki et al.** CO₂–performance analyses | Performance changes are often summarized as a **fractional change per ~100 ppm CO₂** (task-dependent; sometimes ~**1%/100 ppm** in pooled fits, with uncertainty). | Motivates default `co2_productivity_loss_per_100ppm: 0.01` and a reference near **800 ppm**. |
+| **Allen et al. (2016)** COGfx | Controlled exposures show **cognitive scores** can drop substantially as CO₂ rises / ventilation worsens (effects can be **larger** than mild office-task % changes). | Supports that elevated CO₂ is cognitively costly. Defaults stay **conservative** (capped 15%, ~1%/100 ppm) rather than using the largest COGfx magnitudes. |
+
+Again, **800 ppm / 1%/100 ppm** is an **order-of-magnitude proxy**, not “the” Seppänen or Allen equation.
+
+#### Related config keys
+
+| Key | Role |
+|-----|------|
+| RTP `realtime_price`, `gas_price_per_kwh` | Electric/gas `$` = kWh × price (no extra weights) |
+| `labor_cost_per_person_hour` | Wage used to monetize thermal/IAQ loss |
+| `adaptive_balancing` | Online scales so EMA(PPD/CO₂ $) track EMA(energy $); see above |
+| `thermal_comfort_model` | `ppd_productivity` \| `ppd` \| `temperature` |
+| `co2_model` | `productivity` \| `threshold` |
+| `cost_normalization` | `absolute` \| `per_m2` |
+
+Full comments and defaults live in `config/hvac_config.yaml` under `reward`.
 
 ---
 
@@ -305,17 +504,17 @@ By default the simulation uses a **flat outdoor CO₂** value (`simulation.outdo
 
 | Event | Start (month/day hour) | Duration | Peak +ppm | Scenario |
 |-------|------------------------|----------|-----------|----------|
-| `winter_inversion` | Jan 18, 00:00 | 48 h | +70 | Stagnant cold-air pool |
-| `industrial_release` | Mar 10, 14:00 | 8 h | +50 | Factory/plant upset |
-| `smog_inversion` | Apr 22, 00:00 | 36 h | +80 | Heat-inversion smog |
-| `smoke_alert` | May 8, 06:00 | 18 h | +35 | Regional air-quality alert |
-| `wildfire_smoke` | Jun 5, 06:00 | 72 h | +150 | Early-summer wildfire |
-| `holiday_fireworks` | Jul 4, 22:00 | 4 h | +20 | Evening combustion spike |
-| `pollution_spike` | Jul 14, 10:00 | 12 h | +60 | Industrial/traffic spike |
-| `wildfire_smoke_2` | Aug 18, 08:00 | 60 h | +120 | Late-summer wildfire |
-| `harvest_burn` | Oct 15, 07:00 | 12 h | +45 | Agricultural field burning |
+| `winter_inversion` | Jan 18, 00:00 | 48 h | +200 | Stagnant cold-air pool |
+| `industrial_release` | Mar 10, 14:00 | 8 h | +140 | Factory/plant upset |
+| `smog_inversion` | Apr 22, 00:00 | 36 h | +220 | Heat-inversion smog |
+| `smoke_alert` | May 8, 06:00 | 18 h | +100 | Regional air-quality alert |
+| `wildfire_smoke` | Jun 5, 06:00 | 72 h | +350 | Early-summer wildfire |
+| `holiday_fireworks` | Jul 4, 22:00 | 4 h | +60 | Evening combustion spike |
+| `pollution_spike` | Jul 14, 10:00 | 12 h | +170 | Industrial/traffic spike |
+| `wildfire_smoke_2` | Aug 18, 08:00 | 60 h | +300 | Late-summer wildfire |
+| `harvest_burn` | Oct 15, 07:00 | 12 h | +125 | Agricultural field burning |
 
-**Traffic jam events** — 20 additional localized backups (`traffic_jam_01` … `traffic_jam_20`), roughly 1–2 per month (morning ~08:00 or evening ~17:00, 4–7 h, +30–44 ppm). Examples: Jan 9 morning (+32), Jun 24 evening (+42), Sep 12 morning (+35), Dec 18 evening (+44). Full list is in `TRAFFIC_JAM_EVENTS` in `generate_outdoor_co2.py`.
+**Traffic jam events** — 20 additional localized backups (`traffic_jam_01` … `traffic_jam_20`), roughly 1–2 per month (morning ~08:00 or evening ~17:00, 4–7 h, **+85–125 ppm**). Full list is in `TRAFFIC_JAM_EVENTS` in `generate_outdoor_co2.py`. Weekday rush hour peaks are **+85 ppm** (morning) and **+70 ppm** (evening).
 
 Each event is a single Gaussian pulse — it happens **once** on that calendar date in the generated year. Add your own with any label via `--event` or `--events-file`. An example JSON with seven custom events is in `data/co2_events_example.json`.
 
@@ -447,14 +646,47 @@ OA Mixing Box → CoilSystem:Cooling:DX → Coil:Heating:Fuel (gas) → Fan:Vari
 
 Each PACU distributes conditioned air to VAV terminal boxes at its 5 zones. Supply air temperature is managed by `SetpointManager:Warmest` (range 12.8–15.6 °C), which automatically raises the SAT to the warmest value that still satisfies the zone with the highest cooling load. This setpoint can be overridden via the EnergyPlus API using the actuator on `PACU_VAV_<floor> Supply Equipment Outlet Node`.
 
-**Controllable actuators per zone (via EnergyPlus Python API):**
+**Controllable actuators via EnergyPlus Python API:**
 
 | Actuator | Component type | Control type | Key |
 |----------|---------------|--------------|-----|
 | Heating setpoint | `Zone Temperature Control` | `Heating Setpoint` | `<zone_name>` |
 | Cooling setpoint | `Zone Temperature Control` | `Cooling Setpoint` | `<zone_name>` |
-| Infiltration airflow | `Zone Infiltration` | `Air Exchange Flow Rate` | `<zone_name> Infiltration` |
+| AHU outdoor-air mass flow | `Outdoor Air Controller` | `Air Mass Flow Rate` | `PACU_VAV_BOT_OA_CONTROLLER`, `PACU_VAV_MID_OA_CONTROLLER`, `PACU_VAV_TOP_OA_CONTROLLER` |
 | Supply air temp | `System Node Setpoint` | `Temperature Setpoint` | `PACU_VAV_<floor> Supply Equipment Outlet Node` |
+
+The same RL outdoor-air action is sent to all three PACU outdoor-air controllers in kg/s. The live airflow plots report the resulting `Air System Outdoor Air Mass Flow Rate` for `PACU_VAV_bot`, `PACU_VAV_mid`, and `PACU_VAV_top` (actual) plus the commanded OA overlay. To make commanded OA trackable in unoccupied hours, `create_custom_idf` forces `HVACOperationSchd` and `MinOA_MotorizedDamper_Sched` to always-on (stock fans/OA are otherwise off overnight). The economizer-scale upper bound comes from EnergyPlus autosizing: the OA controller maximums are `4.40`, `4.26`, and `4.94 m3/s`, so the largest controller is roughly `4.94 * 1.2 = 5.9 kg/s`.
+
+**Why commanded OA often differs from actual OA**
+
+The RL actuator request is accepted, but EnergyPlus still enforces:
+
+\[
+\dot{m}_{\text{OA, actual}} \le \dot{m}_{\text{mixed / supply}}
+\]
+
+From the EnergyPlus EMS Application Guide (*Outdoor Air Controller*): the actuated mass flow rate is not allowed to be greater than the current system mixed air flow rate. If the override exceeds mixed-air flow, OA is clipped to the mixed-air rate (limiting factor: mixed air) — the command is not ignored.
+
+On these VAV PACUs that means:
+
+1. Zone load falls → fan / supply airflow turns down.
+2. The agent may still command 4–6 kg/s OA.
+3. Actual OA is capped near the current supply mass flow (often ~1–2 kg/s in light-load periods).
+4. When load (and supply) briefly rises, actual OA can spike toward the command.
+
+That afternoon gap on the live plot is therefore **supply-flow limiting**, not the occupied/unoccupied schedule issue. The always-on schedule rewrite only fixes overnight “fans off → actual OA ≈ 0.”
+
+Secondary caps: autosized maximum OA (~5–6 kg/s) and max OA fraction × supply flow (stock max-fraction schedules are 1.0 after EMS cleanup). The same command is applied to all three floors, so the three actual traces look similar.
+
+How to read the plot:
+
+| Observation | Interpretation |
+|-------------|----------------|
+| Commanded ≫ actual (afternoon) | Request above current supply flow; AHU is likely near **100% OA** of whatever supply exists |
+| Actual tracks commanded | Supply flow ≥ command (or command is low) |
+| Both ~0 overnight (before always-on patch) | Fans / OA availability off |
+
+**Practical takeaway:** commanded OA is a request, not a guarantee of that mass flow. On VAV systems, a high OA command mainly raises the outdoor-air fraction up to 1.0 of the current supply flow.
 
 Gas heating note: the model uses `Coil:Heating:Fuel` (NaturalGas), so winter heating load appears in `gas[kW]`, not `elec[kW]`.
 

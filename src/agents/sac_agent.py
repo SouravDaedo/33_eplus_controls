@@ -181,6 +181,34 @@ class SACReplayBuffer:
         """Return buffer size."""
         return len(self.buffer)
 
+    def to_numpy_dict(self):
+        """Serialize buffer contents for checkpointing."""
+        if not self.buffer:
+            return None
+        states, actions, rewards, next_states, dones = zip(*self.buffer)
+        return {
+            'states': np.stack(states).astype(np.float32),
+            'actions': np.stack(actions).astype(np.float32),
+            'rewards': np.asarray(rewards, dtype=np.float32),
+            'next_states': np.stack(next_states).astype(np.float32),
+            'dones': np.asarray(dones, dtype=np.float32),
+        }
+
+    def load_numpy_dict(self, data):
+        """Restore buffer contents from a checkpoint payload."""
+        self.buffer.clear()
+        if not data:
+            return
+        n = len(data['states'])
+        for i in range(n):
+            self.push(
+                data['states'][i],
+                data['actions'][i],
+                float(data['rewards'][i]),
+                data['next_states'][i],
+                float(data['dones'][i]),
+            )
+
 
 class SACAgent:
     """Soft Actor-Critic agent for continuous control trading."""
@@ -402,8 +430,12 @@ class SACAgent:
 
         extra_state: optional caller-level metadata to round-trip through the checkpoint
         (e.g. {'episode_count': N}), so a resumed run can continue numbering correctly.
+
+        Also persists the replay buffer so resumed training can continue gradient
+        updates immediately (no warmup refill) when memory already meets the threshold.
         """
-        os.makedirs(os.path.dirname(filepath), exist_ok=True)
+        os.makedirs(os.path.dirname(filepath) or '.', exist_ok=True)
+        replay_payload = self.memory.to_numpy_dict()
         torch.save({
             'actor_state_dict': self.actor.state_dict(),
             'critic1_state_dict': self.critic1.state_dict(),
@@ -420,14 +452,16 @@ class SACAgent:
             'critic1_losses': self.critic1_losses,
             'critic2_losses': self.critic2_losses,
             'alpha_losses': self.alpha_losses,
+            'replay_buffer': replay_payload,
             'extra_state': extra_state or {},
         }, filepath)
-        print(f"SAC model saved to {filepath}")
+        n_replay = 0 if replay_payload is None else len(replay_payload['states'])
+        print(f"SAC model saved to {filepath} (replay_buffer={n_replay} transitions)")
 
     def load(self, filepath: str):
         """Load a trained model. Returns the 'extra_state' dict passed to save() (or {})."""
         if os.path.exists(filepath):
-            checkpoint = torch.load(filepath, map_location=self.device)
+            checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
 
             self.actor.load_state_dict(checkpoint['actor_state_dict'])
             self.critic1.load_state_dict(checkpoint['critic1_state_dict'])
@@ -450,7 +484,18 @@ class SACAgent:
             self.critic2_losses = checkpoint.get('critic2_losses', [])
             self.alpha_losses = checkpoint.get('alpha_losses', [])
 
-            print(f"SAC model loaded from {filepath}")
+            replay_payload = checkpoint.get('replay_buffer')
+            if replay_payload is not None:
+                self.memory.load_numpy_dict(replay_payload)
+                print(
+                    f"SAC model loaded from {filepath} "
+                    f"(restored replay_buffer={len(self.memory)} transitions)"
+                )
+            else:
+                print(
+                    f"SAC model loaded from {filepath} "
+                    "(no replay_buffer in checkpoint — warmup refill required)"
+                )
             return checkpoint.get('extra_state', {}) or {}
         else:
             print(f"No SAC model found at {filepath}")
